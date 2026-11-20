@@ -1,0 +1,27 @@
+# Leanarr - copy to docker-compose.yml and adjust paths. Secrets go in .env (see .env.example).
+services:
+  leanarr:
+    build: .
+    image: leanarr:local
+    container_name: leanarr
+    user: "99:100"                 # same user/group as your other media apps, so file ownership stays the same
+    restart: unless-stopped
+    ports: ["8282:8282"]           # status page + remote worker API
+    env_file: .env
+    environment:
+      TZ: America/New_York
+      LEANARR_MODE: report          # report = only list what it would shrink; shrink = do it
+      LEANARR_LIBRARIES: /media/tv,/media/movies
+      LEANARR_WINDOW: "01:00-09:00" # shrink only at night
+      LEANARR_CRF: "22"
+      LEANARR_PRESET: slow
+      LEANARR_MIN_SAVING: "0.10"    # keep a result only if at least 10% smaller
+      LEANARR_RELEASE_SEEDS: "false" # true = remove torrents that met their seed_rules.json rule (files kept)
+      QBIT_URL: http://qbittorrent:8080
+      QBIT_USER: admin
+      SONARR_URL: http://sonarr:8989
+      RADARR_URL: http://radarr:7878
+    volumes:
+      - /path/to/appdata/leanarr:/config   # database + seed_rules.json (back this up)
+      - /path/to/fast-scratch/leanarr:/work # encode scratch space (SSD recommended, no backup needed)
+      - /path/to/media:/media               # MUST be the same path qBittorrent/Sonarr/Radarr use

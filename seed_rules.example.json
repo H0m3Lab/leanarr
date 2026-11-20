@@ -1,0 +1,13 @@
+{
+  "ExampleTracker": {
+    "hosts": ["tracker.example.org", "announce.example.org"],
+    "ratio": 1.0,
+    "single_hours": 72,
+    "pack_hours": 168
+  },
+  "AnotherTracker": {
+    "hosts": ["another.example.net"],
+    "ratio": 2.0,
+    "single_hours": 240
+  }
+}
