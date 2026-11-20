@@ -1,0 +1,21 @@
+{
+  "name": "Leanarr",
+  "slug": "leanarr",
+  "tagline": "Seed-aware library shrinker for Plex, Sonarr and Radarr.",
+  "description": "Leanarr re-encodes old, inefficient video to HEVC to win back disk space, and never touches a file a torrent still needs. It starts in report mode, verifies every result, and replaces files safely.",
+  "status": "early",
+  "features": [
+    "Old codecs only; HDR and Dolby Vision left alone",
+    "Fail-closed qBittorrent seed protection",
+    "Optional release of finished seeds per tracker rule",
+    "Verification before every replacement",
+    "Night-time encoding window",
+    "Remote NVENC or x265 workers"
+  ],
+  "stack": ["Python", "ffmpeg", "SQLite", "Docker"],
+  "repository": "https://github.com/H0m3Lab/leanarr",
+  "documentation": "https://github.com/H0m3Lab/leanarr#readme",
+  "changelog": "https://github.com/H0m3Lab/leanarr/blob/main/CHANGELOG.md",
+  "license": "MIT",
+  "screenshots": []
+}

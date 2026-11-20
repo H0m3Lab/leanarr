@@ -81,8 +81,27 @@ python3 leanarr.py --scan     # one scan, print the report, exit
 python3 leanarr.py --once     # one scan + shrink everything eligible now (ignores the window)
 ```
 
+## Troubleshooting
+
+- **Nothing gets shrunk:** check that `LEANARR_MODE` is `shrink` (the default `report` changes nothing)
+  and that the current time is inside `LEANARR_WINDOW`.
+- **Every file shows as protected:** Leanarr can't reach qBittorrent, so it fails closed. Check
+  `QBIT_URL`, `QBIT_USER`, and `QBIT_PASSWORD`.
+- **Seeding files are not recognised as protected:** the media paths inside Leanarr must be the same as
+  in qBittorrent, Sonarr, and Radarr (e.g. all `/media/...`).
+- **A file was skipped after encoding:** verification failed or the saving was below
+  `LEANARR_MIN_SAVING`; the original stays. The status page shows the reason.
+- Logs: the status page event list, or `docker compose logs leanarr`.
+
 ## Roadmap
 
 - Per-library settings, pause/resume from the status page
+
+## Releases and contributing
+
+Versions and changes: [Releases](https://github.com/H0m3Lab/leanarr/releases) and [CHANGELOG.md](CHANGELOG.md).
+Developer and AI-agent guide: [CLAUDE.md](CLAUDE.md). Bug reports and ideas are welcome as issues; see the
+[contribution guide](https://github.com/H0m3Lab/.github/blob/main/CONTRIBUTING.md). Report security
+problems privately through the **Security** tab.
 
 License: MIT · Status: early (0.2). Back up your library before letting any tool rewrite it.
