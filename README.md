@@ -15,7 +15,7 @@ still needs breaks the torrent (and can earn you a hit & run on private trackers
 3. **Protects seeding files (fail-closed):** it asks qBittorrent for every file of every torrent. If qBittorrent
    can't be reached, *everything* counts as protected. The check runs again right before a file is replaced.
 4. **Optionally releases finished seeds:** a stopped torrent that met its tracker's seeding rule is removed from
-   qBittorrent (files kept), so its files become eligible.
+   qBittorrent (files kept), so its files become eligible. This runs on every scan, in report mode too.
 5. **Encodes** with ffmpeg/libx265 (default CRF 22, preset slow) at the lowest CPU priority, only inside a time
    window. Audio, subtitles, chapters and attachments are copied as they are; MP4 text subtitles become SRT.
 6. **Verifies** before replacing: HEVC video, same length (±1 s), same number of audio and subtitle tracks, and

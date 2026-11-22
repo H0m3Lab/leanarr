@@ -21,7 +21,7 @@ import argparse, datetime as dt, html, json, os, re, shlex, shutil, sqlite3, sub
 import urllib.error, urllib.parse, urllib.request, http.cookiejar
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 
 def env(name, default):
@@ -79,7 +79,8 @@ SETTINGS = {
                         "those torrents (hit & runs on private trackers)."),
     "release_seeds": (env("LEANARR_RELEASE_SEEDS", "false"), "bool", "Release finished seeds",
                       "Remove stopped torrents that met their tracker's seeding rule from qBittorrent "
-                      "(files kept), so their files can be shrunk."),
+                      "(files kept), so their files can be shrunk. Runs on every scan, in report mode too "
+                      "(it never touches files on disk)."),
     "lease_hours": ("12", "int:1:168", "Remote job timeout (hours)",
                     "A remote job that doesn't report back in time goes back into the queue."),
 }
@@ -294,7 +295,7 @@ def release_finished_seeds():
         videos = [f for f in qb.get("/api/v2/torrents/files?hash=" + t["hash"]) if VIDEO_EXT.search(f["name"])]
         need = rule["pack"] if len(videos) > 1 else rule["single"]
         if t.get("ratio", 0) >= rule["ratio"] or t.get("seeding_time", 0) >= need:
-            if S("mode") == "shrink" and S_bool("release_seeds"):
+            if S_bool("release_seeds"):
                 qb.post("/api/v2/torrents/delete", {"hashes": t["hash"], "deleteFiles": "false"})
                 log(f"RELEASED (seeding rule met, files kept): [{name}] {t['name']}")
             else:
@@ -917,8 +918,7 @@ def main():
     while True:
         ok = True
         try:
-            if S("mode") == "shrink":
-                release_finished_seeds()
+            release_finished_seeds()
         except Exception as e:
             ok = False
             log(f"release check error: {e}")

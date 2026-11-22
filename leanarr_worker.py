@@ -17,7 +17,7 @@ e.g. the gyan.dev "full" build).
 """
 import argparse, http.client, json, os, platform, shlex, subprocess, sys, tempfile, time, urllib.parse
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 
 LOG_FILE = None

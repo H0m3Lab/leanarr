@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-21
+
+### Changed
+- Releasing finished seeds (`release_seeds`) no longer requires shrink mode: it runs on every scan,
+  in report mode too. It only removes the torrent from qBittorrent; files on disk are never touched.
+
 ## [0.2.0] - 2026-11-19
 
 First public release.
