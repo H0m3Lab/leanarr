@@ -24,6 +24,17 @@ still needs breaks the torrent (and can earn you a hit & run on private trackers
    (MP4/AVI become `.mkv`). Sonarr/Radarr get a rescan for that show/movie.
 8. **Report mode (default)** changes nothing and shows what it *would* shrink and the estimated saving.
 
+### Dolby track for DTS-only files (optional)
+
+Many TVs' built-in apps (and some players) can't play DTS: you get silence, or the server has to transcode.
+With `LEANARR_DOLBY_MODE=add`, Leanarr gives every **MKV whose audio is DTS with no Dolby track** a Dolby
+track made from the DTS track: E-AC-3 (Dolby Digital Plus) or AC-3, up to 5.1, as the **first, default**
+audio track. The DTS track(s), video, subtitles, chapters and attachments are copied unchanged. It is a
+separate job from shrinking (works in report mode too) with the same rules: never a file a torrent uses,
+verified before the original is replaced (one more audio track, same video/subtitle tracks, same length, a
+decode test of the new track), written next to the original as a hidden `.part` and renamed over it.
+Longest files go first, so movies are done before TV episodes. `report` only counts the files.
+
 Status page: `http://<host>:8282` (also `/report.json`).
 
 ## Settings (environment variables)
@@ -37,6 +48,9 @@ Status page: `http://<host>:8282` (also `/report.json`).
 | `LEANARR_MIN_SAVING` | `0.10` | keep the result only if at least 10% smaller |
 | `LEANARR_MIN_SIZE_MB` | `200` | ignore smaller files |
 | `LEANARR_RELEASE_SEEDS` | `false` | remove torrents that met their seeding rule (files kept) |
+| `LEANARR_DOLBY_MODE` | `off` | Dolby track for DTS-only MKVs: `off`, `report` (count only) or `add` |
+| `LEANARR_DOLBY_CODEC` / `LEANARR_DOLBY_BITRATE` | `eac3` / `640k` | `eac3` (Dolby Digital Plus) or `ac3` (Dolby Digital); `384k`, `448k` or `640k` |
+| `LEANARR_DOLBY_WINDOW` | `always` | when the Dolby track job may run (`HH:MM-HH:MM`, `always`, `never`) |
 | `QBIT_URL`, `QBIT_USER`, `QBIT_PASSWORD` | | qBittorrent WebUI (4.x and 5.x) |
 | `SONARR_URL`, `SONARR_API_KEY`, `RADARR_URL`, `RADARR_API_KEY` | | for the rescan after a replacement |
 | `LEANARR_DB`, `LEANARR_WORK_DIR`, `LEANARR_PORT` | `/config/leanarr.db`, `/work`, `8282` | storage / port |
@@ -91,6 +105,9 @@ python3 leanarr.py --once     # one scan + shrink everything eligible now (ignor
   in qBittorrent, Sonarr, and Radarr (e.g. all `/media/...`).
 - **A file was skipped after encoding:** verification failed or the saving was below
   `LEANARR_MIN_SAVING`; the original stays. The status page shows the reason.
+- **The Dolby track job does nothing:** `LEANARR_DOLBY_MODE` must be `add`, the time inside
+  `LEANARR_DOLBY_WINDOW`, and the file an MKV with DTS and no AC-3/E-AC-3/TrueHD track that no torrent uses.
+  Files that are still seeding wait ("Waiting (seeding)") and are done once their torrent is released.
 - Logs: the status page event list, or `docker compose logs leanarr`.
 
 ## Roadmap

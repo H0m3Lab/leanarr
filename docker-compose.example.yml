@@ -17,6 +17,7 @@ services:
       LEANARR_PRESET: slow
       LEANARR_MIN_SAVING: "0.10"    # keep a result only if at least 10% smaller
       LEANARR_RELEASE_SEEDS: "false" # true = remove torrents that met their seed_rules.json rule (files kept)
+      LEANARR_DOLBY_MODE: "off"     # add = give DTS-only MKVs a Dolby (E-AC-3) track for TVs without DTS; report = count only
       QBIT_URL: http://qbittorrent:8080
       QBIT_USER: admin
       SONARR_URL: http://sonarr:8989

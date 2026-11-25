@@ -6,6 +6,17 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-25
+
+### Added
+- Dolby track for DTS-only files (`dolby_mode`: off / report / add, default off). MKVs whose audio is DTS with
+  no AC-3/E-AC-3/TrueHD track get a Dolby track (E-AC-3 or AC-3, up to 5.1, default 640k) made from the DTS
+  track, as the first and default audio track; everything else is copied unchanged. Same seeding protection
+  (fail-closed, re-checked right before the replace), verification (track counts, length, decode test of the
+  new track) and safe replace as shrinking. Longest files first (movies before episodes). Own time window
+  (`dolby_window`), own section on the status page and in `/report.json`. Independent of the shrink mode.
+- The scan now records each file's audio codecs; files scanned by an older version are read once more.
+
 ## [0.2.1] - 2026-11-21
 
 ### Changed

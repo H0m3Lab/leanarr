@@ -11,6 +11,8 @@ verified and clearly smaller.
     NVIDIA GPU running leanarr_worker.py): they fetch a job over HTTP, encode, upload the
     result; this server does every check and the safe replacement itself
   * editable settings page (encoders, window, checks), report mode by default
+  * optional Dolby track: DTS-only MKVs get a Dolby (E-AC-3 / AC-3) track made from the DTS track, for TVs
+    that can't play DTS; same seeding protection, verify and safe replace
 
 Run:  python3 leanarr.py            (daemon: web UI + API + scanner + local worker)
       python3 leanarr.py --scan     (one scan, print the report, exit)
@@ -21,7 +23,7 @@ import argparse, datetime as dt, html, json, os, re, shlex, shutil, sqlite3, sub
 import urllib.error, urllib.parse, urllib.request, http.cookiejar
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 
 
 def env(name, default):
@@ -83,7 +85,19 @@ SETTINGS = {
                       "(it never touches files on disk)."),
     "lease_hours": ("12", "int:1:168", "Remote job timeout (hours)",
                     "A remote job that doesn't report back in time goes back into the queue."),
+    "dolby_mode": (env("LEANARR_DOLBY_MODE", "off"), ["off", "report", "add"], "Dolby track for DTS-only files",
+                   "Many TVs' built-in apps can't play DTS (silence, or the server has to transcode). 'add' writes a "
+                   "Dolby track made from the DTS track as the first, default audio track; the DTS track(s) stay in "
+                   "the file. Only MKV files with DTS and no Dolby (AC-3 / E-AC-3 / TrueHD) track, never a file a "
+                   "torrent uses. Longest files first (movies before episodes). 'report' only counts them. "
+                   "Independent of the shrink mode."),
+    "dolby_codec": (env("LEANARR_DOLBY_CODEC", "eac3"), ["eac3", "ac3"], "Dolby track format",
+                    "eac3 = Dolby Digital Plus, ac3 = Dolby Digital (oldest, plays on everything). Max 5.1 channels."),
+    "dolby_bitrate": (env("LEANARR_DOLBY_BITRATE", "640k"), ["384k", "448k", "640k"], "Dolby track bitrate", ""),
+    "dolby_window": (env("LEANARR_DOLBY_WINDOW", "always"), "text", "Dolby track hours",
+                     "HH:MM-HH:MM, 'always' or 'never'. Each file is rewritten once (disk-heavy, light on CPU)."),
 }
+DOLBY_CODECS = ("ac3", "eac3", "truehd")
 
 VIDEO_EXT = re.compile(r"(?i)\.(mkv|mp4|m4v|avi|mov|wmv|mpg|mpeg|ts|m2ts|vob|flv|webm)$")
 SKIP_PATH = re.compile(r"(?i)(^|/)(sample|samples|extras|featurettes|behind the scenes|trailers|other)(/|$)|[ ._-]sample[ ._-]")
@@ -133,7 +147,8 @@ def init_db():
                                             last_seen real, note text);
         """)
         cols = {r[1] for r in c.execute("pragma table_info(files)")}
-        for col, typ in (("worker", "text"), ("lease_until", "real"), ("layout_ok", "integer")):
+        for col, typ in (("worker", "text"), ("lease_until", "real"), ("layout_ok", "integer"),
+                         ("acodecs", "text"), ("audio_status", "text"), ("audio_reason", "text")):
             if col not in cols:
                 c.execute(f"alter table files add column {col} {typ}")
 
@@ -217,7 +232,20 @@ def probe_fields(info):
             "hdr": hdr_kind(v) if v else "", "duration": duration,
             "audio_n": sum(1 for s in streams if s.get("codec_type") == "audio"),
             "sub_n": sum(1 for s in streams if s.get("codec_type") == "subtitle"),
-            "layout_ok": 1 if (v is not None and first_video is v) else 0}
+            "layout_ok": 1 if (v is not None and first_video is v) else 0,
+            "acodecs": ",".join(s.get("codec_name") or "?" for s in streams if s.get("codec_type") == "audio")}
+
+
+def audio_decide(path, acodecs):
+    """(audio_status, reason) for the Dolby-track feature, from stored facts."""
+    codecs = [c for c in (acodecs or "").split(",") if c]
+    if not path.lower().endswith(".mkv"):
+        return "skip", "not MKV"
+    if any(c in DOLBY_CODECS for c in codecs):
+        return "skip", "has a Dolby track"
+    if "dts" not in codecs:
+        return "skip", "no DTS track"
+    return "candidate", "DTS only"
 
 
 def reclassify_all():
@@ -313,7 +341,9 @@ def scan():
     with db() as c:
         c.execute("update files set status='candidate', worker=null, lease_until=null "
                   "where status='working' and lease_until < ?", (time.time(),))
-        known = {r["path"]: (r["size"], r["mtime"], r["status"]) for r in c.execute("select path,size,mtime,status from files")}
+        c.execute("update files set audio_status='candidate', audio_reason='DTS only' where audio_status='wait'")
+        known = {r["path"]: (r["size"], r["mtime"], r["status"], r["acodecs"])
+                 for r in c.execute("select path,size,mtime,status,acodecs from files")}
     min_bytes = int(S("min_size_mb")) * 1024 * 1024
     on_disk = set()
     for lib in CONFIG["libraries"]:
@@ -331,21 +361,41 @@ def scan():
                 seen += 1
                 prev = known.get(p)
                 same = prev and prev[0] == st.st_size and prev[1] == st.st_mtime
-                if same and prev[2] in ("done", "failed", "too-small-gain", "working"):
+                if same and prev[2] in ("done", "failed", "too-small-gain", "working") and prev[3] is not None:
                     continue
                 cols = None
                 if SKIP_PATH.search("/" + os.path.relpath(p, lib)):
-                    cols = {"status": "skip", "reason": "sample/extras"}
-                elif st.st_size < min_bytes:
+                    cols = {"status": "skip", "reason": "sample/extras", "audio_status": "skip", "audio_reason": "sample/extras"}
+                elif st.st_size < min_bytes and not same:
                     cols = {"status": "skip", "reason": f"smaller than {S('min_size_mb')} MB"}
+                    try:   # small files still count for the Dolby track (e.g. TV episodes)
+                        f = probe_fields(ffprobe(p))
+                        probed += 1
+                        a_st, a_reason = audio_decide(p, f["acodecs"])
+                        cols.update(acodecs=f["acodecs"], duration=f["duration"], audio_n=f["audio_n"],
+                                    audio_status=a_st, audio_reason=a_reason)
+                    except Exception as e:
+                        cols.update(audio_status="skip", audio_reason=f"probe failed: {e}")
                 elif not same:
                     try:
                         f = probe_fields(ffprobe(p))
                         probed += 1
                         status, reason, est = decide(f["vcodec"], f["hdr"], f["duration"], f["layout_ok"], st.st_size)
-                        cols = {**f, "status": status, "reason": reason, "est_saving": est}
+                        a_st, a_reason = audio_decide(p, f["acodecs"])
+                        cols = {**f, "status": status, "reason": reason, "est_saving": est,
+                                "audio_status": a_st, "audio_reason": a_reason}
                     except Exception as e:
                         cols = {"status": "skip", "reason": f"probe failed: {e}"}
+                elif prev[3] is None:
+                    # known file from before the Dolby feature (or a small file): read its audio tracks once
+                    try:
+                        f = probe_fields(ffprobe(p))
+                        probed += 1
+                        a_st, a_reason = audio_decide(p, f["acodecs"])
+                        cols = {"acodecs": f["acodecs"], "audio_n": f["audio_n"], "duration": f["duration"],
+                                "audio_status": a_st, "audio_reason": a_reason}
+                    except Exception as e:
+                        cols = {"acodecs": "", "audio_status": "skip", "audio_reason": f"probe failed: {e}"}
                 with db() as c:
                     if cols is not None:
                         cols.update(size=st.st_size, mtime=st.st_mtime, probed_at=time.time())
@@ -359,6 +409,13 @@ def scan():
                                       ("used by a torrent" if qbit_ok else "qBittorrent unreachable", p))
                         elif row["status"] == "protected":
                             c.execute("update files set status='candidate', reason=vcodec||' -> hevc' where path=?", (p,))
+                    arow = c.execute("select audio_status from files where path=?", (p,)).fetchone()
+                    if arow and arow["audio_status"] in ("candidate", "protected"):
+                        if not qbit_ok or os.path.normpath(p) in protected:
+                            c.execute("update files set audio_status='protected', audio_reason=? where path=?",
+                                      ("used by a torrent" if qbit_ok else "qBittorrent unreachable", p))
+                        elif arow["audio_status"] == "protected":
+                            c.execute("update files set audio_status='candidate', audio_reason='DTS only' where path=?", (p,))
     with db() as c:
         for p in set(known) - on_disk:
             c.execute("delete from files where path=? and status!='done'", (p,))
@@ -384,8 +441,15 @@ def report_data():
             "select new_path, size, new_size, done_at, worker from files where status='done' order by done_at desc limit 15")]
         events = [dict(r) for r in c.execute("select ts, msg from events order by id desc limit 40")]
         workers = [dict(r) for r in c.execute("select * from workers order by last_seen desc")]
+        dolby = [dict(r) for r in c.execute(
+            "select audio_status status, count(*) n, sum(size) bytes from files where audio_status is not null "
+            "and audio_status!='skip' group by audio_status order by n desc")]
+        dolby_recent = [dict(r) for r in c.execute(
+            "select path, audio_status, audio_reason from files where audio_status in ('done','failed','working') "
+            "order by case audio_status when 'working' then 0 else 1 end, mtime desc limit 15")]
     return {"by_status": by_status, "reasons": reasons, "per_lib": per_lib, "top": top,
-            "working": working, "done": done, "events": events, "workers": workers}
+            "working": working, "done": done, "events": events, "workers": workers,
+            "dolby": dolby, "dolby_recent": dolby_recent}
 
 
 def print_report():
@@ -538,7 +602,8 @@ def record_result(row, result, who):
 
 def next_candidate():
     with db() as c:
-        return c.execute("select rowid as id, * from files where status='candidate' order by est_saving desc limit 1").fetchone()
+        return c.execute("select rowid as id, * from files where status='candidate' and coalesce(audio_status,'')!='working' "
+                         "order by est_saving desc limit 1").fetchone()
 
 
 def local_worker(once=False):
@@ -576,6 +641,129 @@ def local_worker(once=False):
         except Exception as e:
             result = f"failed: {e}"
         record_result(row, result, "local")
+
+
+# ------------------------------------------------------------------ Dolby track (DTS-only files)
+def dolby_cmd(src, dst, info):
+    """ffmpeg command: new Dolby track first (from the default DTS track, else the first one), then every
+    original audio track, video, subtitles, attachments and chapters copied unchanged."""
+    auds = [s for s in info["streams"] if s.get("codec_type") == "audio"]
+    dts = [i for i, s in enumerate(auds) if s.get("codec_name") == "dts"]
+    src_i = next((i for i in dts if (auds[i].get("disposition") or {}).get("default")), dts[0])
+    ch = int(auds[src_i].get("channels") or 6)
+    lang = (auds[src_i].get("tags") or {}).get("language") or "und"
+    codec = S("dolby_codec")
+    name = {"eac3": "Dolby Digital Plus", "ac3": "Dolby Digital"}[codec]
+    layout = "5.1" if ch >= 6 else f"{ch}.0" if ch > 2 else "2.0"
+    cmd = ["nice", "-n", CONFIG["nice"], "ffmpeg", "-hide_banner", "-nostdin", "-y", "-loglevel", "error", "-i", src,
+           "-map", "0:v?", "-map", f"0:a:{src_i}", "-map", "0:a", "-map", "0:s?", "-map", "0:t?",
+           "-map_metadata", "0", "-map_chapters", "0", "-c", "copy",
+           "-c:a:0", codec, "-b:a:0", S("dolby_bitrate"), "-ac:a:0", str(min(ch, 6)), "-ar:a:0", "48000",
+           "-metadata:s:a:0", f"title={name} {layout} (from DTS)", "-metadata:s:a:0", f"language={lang}",
+           "-disposition:a:0", "default"]
+    for i in range(1, len(auds) + 1):
+        cmd += [f"-disposition:a:{i}", "0"]
+    return cmd + ["-max_muxing_queue_size", "4096", "-f", "matroska", dst], len(auds), ch
+
+
+def dolby_verify(src_info, out_path, n_audio, codec):
+    info = ffprobe(out_path)
+    count = lambda i, k: sum(1 for s in i["streams"] if s.get("codec_type") == k)  # noqa: E731
+    auds = [s for s in info["streams"] if s.get("codec_type") == "audio"]
+    if len(auds) != n_audio + 1 or auds[0].get("codec_name") != codec:
+        return f"audio tracks wrong ({len(auds)} vs {n_audio}+1, first {auds[0].get('codec_name') if auds else '-'})"
+    for k in ("video", "subtitle", "attachment"):
+        if count(info, k) != count(src_info, k):
+            return f"{k} tracks differ ({count(info, k)} vs {count(src_info, k)})"
+    d_src = float((src_info.get("format") or {}).get("duration") or 0)
+    d_out = float((info.get("format") or {}).get("duration") or 0)
+    if abs(d_out - d_src) > max(2.0, 0.002 * d_src):
+        return f"length differs ({d_out:.1f}s vs {d_src:.1f}s)"
+    # decode 30 s of the new track from the middle; only errors of that decoder count
+    # (the null muxer and the video decoder print harmless warnings for many Blu-ray files)
+    p = subprocess.run(["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-ss", str(int(d_out / 2)), "-t", "30",
+                        "-i", out_path, "-map", "0:a:0", "-vn", "-sn", "-dn", "-f", "null", "-"],
+                       capture_output=True, text=True, timeout=600)
+    bad = [x for x in p.stderr.splitlines() if x.startswith(f"[{codec} @") or "Error while decoding" in x]
+    if p.returncode != 0 or bad:
+        return f"decode test failed: {(bad or p.stderr.splitlines() or ['?'])[0][:200]}"
+    return None
+
+
+def add_dolby_track(row):
+    """One file: write the new MKV next to the original, verify, re-check seeding, replace. Returns a result text."""
+    src = row["path"]
+    why = precheck(row)
+    if why:
+        return why
+    info = ffprobe(src)
+    if audio_decide(src, probe_fields(info)["acodecs"])[0] != "candidate":
+        return "skip: no longer DTS-only"
+    part = os.path.join(os.path.dirname(src), ".leanarr-" + os.path.basename(src) + ".part")
+    codec = S("dolby_codec")
+    try:
+        cmd, n_audio, ch = dolby_cmd(src, part, info)
+        log(f"DOLBY [{codec} {S('dolby_bitrate')} from {ch}ch DTS] {src} ({gb(row['size'])})")
+        t0 = time.time()
+        p = subprocess.run(cmd, capture_output=True, text=True)
+        if p.returncode != 0:
+            return f"failed: ffmpeg: {p.stderr.strip()[-300:]}"
+        problem = dolby_verify(info, part, n_audio, codec)
+        if problem:
+            return f"failed: verify: {problem}"
+        try:
+            if os.path.normpath(src) in torrent_files():
+                return "protected: became used by a torrent meanwhile"
+        except Exception as e:
+            return f"protected: qBittorrent check failed before replace ({e})"
+        st = os.stat(src)
+        if st.st_mtime != row["mtime"] or st.st_size != row["size"]:
+            return "skip: original changed meanwhile"
+        shutil.copymode(src, part)
+        os.replace(part, src)
+        new = os.stat(src)
+        acodecs = probe_fields(ffprobe(src))["acodecs"]
+        with db() as c:
+            c.execute("update files set size=?, mtime=?, acodecs=?, audio_n=?, audio_status='done', audio_reason=? "
+                      "where path=?", (new.st_size, new.st_mtime, acodecs, n_audio + 1,
+                                       f"added {codec} {min(ch, 6)}ch from DTS", src))
+        log(f"DOLBY DONE {os.path.basename(src)} ({(time.time() - t0) / 60:.0f} min)")
+        arr_rescan(src)
+        return "done"
+    finally:
+        if os.path.exists(part):
+            os.remove(part)
+
+
+def dolby_worker():
+    with db() as c:   # a job that was running when Leanarr stopped goes back into the queue
+        c.execute("update files set audio_status='candidate' where audio_status='working'")
+    while True:
+        if S("dolby_mode") != "add" or not in_window(S("dolby_window")):
+            time.sleep(60)
+            continue
+        with CLAIM_LOCK:
+            with db() as c:
+                # longest first = movies before TV episodes; never a file a shrink job is working on
+                row = c.execute("select rowid as id, * from files where audio_status='candidate' and status!='working' "
+                                "order by duration desc limit 1").fetchone()
+                if row:
+                    c.execute("update files set audio_status='working' where path=?", (row["path"],))
+        if not row:
+            time.sleep(600)
+            continue
+        try:
+            result = add_dolby_track(row)
+        except Exception as e:
+            result = f"failed: {e}"
+        if result != "done":
+            # 'wait' = try again after the next scan (still settling / changed); scan() puts it back in the queue
+            status = ("protected" if result.startswith("protected")
+                      else "wait" if result.startswith(("skip: too new", "skip: changed", "skip: original changed"))
+                      else "skip" if result.startswith("skip") else "failed")
+            with db() as c:
+                c.execute("update files set audio_status=?, audio_reason=? where path=?", (status, result[:300], row["path"]))
+            log(f"DOLBY {status.upper()}: {row['path']}: {result}")
 
 
 # ------------------------------------------------------------------ remote worker API
@@ -674,9 +862,22 @@ def status_page():
                  f"<td>{'🟢 ' if time.time() - (w['last_seen'] or 0) < 900 else '⚪ '}{ago(w['last_seen'])}</td>"
                  f"<td class='mut'>{esc(w['note'] or '')}</td></tr>" for w in d["workers"]) \
         or "<tr><td class='mut'>no remote worker has checked in yet</td></tr>"
+    ds = {x["status"]: x["n"] for x in d["dolby"]}
+    dolby = ""
+    if S("dolby_mode") != "off":
+        dcards = "".join(f"<div class='card'><div class='mut'>{k}</div><div class='big'>{v:,}</div></div>" for k, v in [
+            ("DTS-only, to do", ds.get("candidate", 0) + ds.get("wait", 0) + ds.get("working", 0)),
+            ("Dolby track added", ds.get("done", 0)), ("Waiting (seeding)", ds.get("protected", 0)),
+            ("Failed", ds.get("failed", 0))])
+        drows = "".join(f"<tr><td>{esc(x['audio_status'])}</td><td class='wrap'>{esc(x['path'])}</td>"
+                        f"<td class='mut'>{esc(x['audio_reason'] or '')}</td></tr>" for x in d["dolby_recent"]) \
+            or "<tr><td class='mut'>nothing yet</td></tr>"
+        dolby = (f"<h2>Dolby track <small class='mut'>({S('dolby_mode')}, {S('dolby_codec')} {S('dolby_bitrate')}, "
+                 f"hours {esc(S('dolby_window'))})</small></h2><div class='cards'>{dcards}</div>"
+                 f"<div class='scroll'><table>{drows}</table></div>")
     body = (f"<h1>Leanarr <small>mode <b>{S('mode')}</b> · local CPU {'on' if S_bool('local_worker') else 'off'} "
             f"({S('window')}) · remote workers {'on' if CONFIG['worker_token'] else 'off'} ({S('remote_window')})</small></h1>{warn}"
-            f"<div class='cards'>{cards}</div>"
+            f"<div class='cards'>{cards}</div>{dolby}"
             f"<h2>Workers</h2><div class='scroll'><table>{wk}</table></div>"
             f"<h2>Working on</h2><div class='scroll'><table>{working}</table></div>"
             f"<h2>Recently shrunk</h2><div class='scroll'><table>{doneh}</table></div>"
@@ -761,7 +962,7 @@ def save_settings(form):
                         raise ValueError
                 except ValueError:
                     errors.append(f"{label}: must be a number between {lo} and {hi}"); continue
-            if key in ("window", "remote_window") and v.lower() not in ("always", "never", "none", "off")                     and not re.fullmatch(r"\d\d:\d\d-\d\d:\d\d", v):
+            if key in ("window", "remote_window", "dolby_window") and v.lower() not in ("always", "never", "none", "off")                     and not re.fullmatch(r"\d\d:\d\d-\d\d:\d\d", v):
                 errors.append(f"{label}: use HH:MM-HH:MM, 'always' or 'never'"); continue
             if key.endswith("_extra"):
                 try:
@@ -915,6 +1116,7 @@ def main():
     srv = ThreadingHTTPServer(("0.0.0.0", CONFIG["port"]), Web)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     threading.Thread(target=local_worker, daemon=True).start()
+    threading.Thread(target=dolby_worker, daemon=True).start()
     while True:
         ok = True
         try:

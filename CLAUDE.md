@@ -25,6 +25,10 @@ One Python process (`leanarr.py`), standard library only:
 - **Verify and replace:** `verify()` checks codec, duration (±1 s), audio/subtitle track counts, and
   minimum saving; `finalize()` copies to a hidden `.part` next to the original, renames over it, and
   asks Sonarr/Radarr to rescan (`arr_rescan()`).
+- **Dolby track (optional):** `audio_decide()` marks DTS-only MKVs (`audio_status` column, separate from the
+  shrink `status`); `dolby_worker()` takes the longest first and `add_dolby_track()` writes a `.part` next to
+  the original with `dolby_cmd()`, checks it with `dolby_verify()`, re-checks seeding, then renames it over
+  the original. It never runs on a file a shrink job is working on (and the other way round).
 - **Web UI:** `Web` (`ThreadingHTTPServer`) serves the status page, `/report.json`, `/settings`,
   `/worker-setup`, `/health`, and the worker API on `LEANARR_PORT` (8282).
 
