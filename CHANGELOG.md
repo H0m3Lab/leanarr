@@ -6,6 +6,23 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-26
+
+### Added
+- Remove unwanted audio tracks from MKVs: `drop_commentary` (audio + subtitle tracks marked or titled as
+  commentary) and `audio_languages` (e.g. `eng`: other-language audio is removed; a file with none of these
+  languages keeps its original language; untagged tracks always stay; a file is never left without audio).
+  Both off by default.
+- The audio step runs during a shrink too, while the encoded file is copied into the library, so a shrunk
+  file is not rewritten a second time.
+- The scan stores per-track facts (codec, language, channels, title, commentary/default flags); files scanned
+  by an older version are read once more.
+
+### Fixed
+- The Dolby track was skipped when the only Dolby track was a stereo commentary. It is now added unless a
+  kept (non-commentary, wanted-language) Dolby track has at least the DTS track's channels (max 5.1).
+- `sample.mkv` files directly in a movie folder were not treated as samples.
+
 ## [0.3.0] - 2026-11-25
 
 ### Added
@@ -40,5 +57,8 @@ First public release.
 - Docker image, example Compose file, `.env.example`, MIT license.
 - Project docs (CLAUDE.md, this changelog) and CI (lint, Docker build, secret scan).
 
-[Unreleased]: https://github.com/H0m3Lab/leanarr/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/H0m3Lab/leanarr/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/H0m3Lab/leanarr/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/H0m3Lab/leanarr/compare/v0.2.1...v0.3.0
+[0.2.1]: https://github.com/H0m3Lab/leanarr/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/H0m3Lab/leanarr/releases/tag/v0.2.0

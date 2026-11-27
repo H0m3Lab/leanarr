@@ -34,6 +34,16 @@ separate job from shrinking (works in report mode too) with the same rules: neve
 verified before the original is replaced (one more audio track, same video/subtitle tracks, same length, a
 decode test of the new track), written next to the original as a hidden `.part` and renamed over it.
 Longest files go first, so movies are done before TV episodes. `report` only counts the files.
+A Dolby track counts only if it is kept (not a commentary, a wanted language) and has at least the DTS
+track's channels (max 5.1), so a stereo commentary in AC-3 no longer stops the new track.
+
+### Removing commentary and other-language tracks (optional)
+
+`LEANARR_DROP_COMMENTARY=true` removes audio and subtitle tracks marked or titled as commentary.
+`LEANARR_AUDIO_LANGUAGES=eng` removes audio in other languages; a file with no English audio keeps its
+original language (the default track's), tracks without a language tag always stay, and a file is never
+left without audio. This is the same audio step as the Dolby track (one rewrite per file, same checks), and
+it is also done while a shrunk file is copied into the library.
 
 Status page: `http://<host>:8282` (also `/report.json`).
 
@@ -50,7 +60,9 @@ Status page: `http://<host>:8282` (also `/report.json`).
 | `LEANARR_RELEASE_SEEDS` | `false` | remove torrents that met their seeding rule (files kept) |
 | `LEANARR_DOLBY_MODE` | `off` | Dolby track for DTS-only MKVs: `off`, `report` (count only) or `add` |
 | `LEANARR_DOLBY_CODEC` / `LEANARR_DOLBY_BITRATE` | `eac3` / `640k` | `eac3` (Dolby Digital Plus) or `ac3` (Dolby Digital); `384k`, `448k` or `640k` |
-| `LEANARR_DOLBY_WINDOW` | `always` | when the Dolby track job may run (`HH:MM-HH:MM`, `always`, `never`) |
+| `LEANARR_DOLBY_WINDOW` | `always` | when the audio step may run (`HH:MM-HH:MM`, `always`, `never`) |
+| `LEANARR_DROP_COMMENTARY` | `false` | remove commentary audio + subtitle tracks from MKVs |
+| `LEANARR_AUDIO_LANGUAGES` | (empty) | audio languages to keep, e.g. `eng`; empty = keep all |
 | `QBIT_URL`, `QBIT_USER`, `QBIT_PASSWORD` | | qBittorrent WebUI (4.x and 5.x) |
 | `SONARR_URL`, `SONARR_API_KEY`, `RADARR_URL`, `RADARR_API_KEY` | | for the rescan after a replacement |
 | `LEANARR_DB`, `LEANARR_WORK_DIR`, `LEANARR_PORT` | `/config/leanarr.db`, `/work`, `8282` | storage / port |
