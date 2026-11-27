@@ -37,6 +37,23 @@ Longest files go first, so movies are done before TV episodes. `report` only cou
 A Dolby track counts only if it is kept (not a commentary, a wanted language) and has at least the DTS
 track's channels (max 5.1), so a stereo commentary in AC-3 no longer stops the new track.
 
+### 4K mode (optional)
+
+4K files are already HEVC, so the normal shrink leaves them alone. With `LEANARR_UHD_MODE=shrink`, 4K files
+above `LEANARR_UHD_MIN_MBPS` (default 30 Mbps, remux / Blu-ray size; streaming rips stay as they are) are
+re-encoded with x265 on the server's own CPU (remote GPU workers never get them), quality first:
+
+1. Four short test samples are encoded at `LEANARR_UHD_CRF_START` (20); the CRF goes down 2 at a time to
+   `LEANARR_UHD_CRF_MIN` (14) until every sample reaches the VMAF 4K target `LEANARR_UHD_VMAF` (95 = no visible
+   difference for most people). Not reached, or less than `LEANARR_UHD_MIN_SAVING` (25%) expected: nothing is encoded.
+2. Full encode. HDR10 colour signalling and mastering metadata are carried over. Dolby Vision: the RPU is taken
+   with dovi_tool (profile 7 converted to 8.1), put back into the new stream and muxed with mkvmerge; picture and
+   RPU frame counts must match. Dolby Vision profile 5 and HLG files are skipped.
+3. Three other points of the finished file are measured again (VMAF ≥ target − 1), HDR / Dolby Vision must still
+   be there, then the usual verify, seeding re-check and safe replace. Audio, subtitles and chapters are copied.
+
+Slow by design: roughly a day per movie on a 16-core CPU with `slow`.
+
 ### Removing commentary and other-language tracks (optional)
 
 `LEANARR_DROP_COMMENTARY=true` removes audio and subtitle tracks marked or titled as commentary.
@@ -63,6 +80,11 @@ Status page: `http://<host>:8282` (also `/report.json`).
 | `LEANARR_DOLBY_WINDOW` | `always` | when the audio step may run (`HH:MM-HH:MM`, `always`, `never`) |
 | `LEANARR_DROP_COMMENTARY` | `false` | remove commentary audio + subtitle tracks from MKVs |
 | `LEANARR_AUDIO_LANGUAGES` | (empty) | audio languages to keep, e.g. `eng`; empty = keep all |
+| `LEANARR_UHD_MODE` | `off` | 4K mode: `off`, `report` or `shrink` |
+| `LEANARR_UHD_MIN_MBPS` / `LEANARR_UHD_VMAF` | `30` / `95` | 4K bitrate floor / VMAF 4K quality target |
+| `LEANARR_UHD_CRF_START` / `LEANARR_UHD_CRF_MIN` / `LEANARR_UHD_PRESET` | `20` / `14` / `slow` | 4K x265 CRF search range and preset |
+| `LEANARR_UHD_X265_PARAMS` | `aq-mode=3:no-sao=1` | extra x265 params for 4K |
+| `LEANARR_UHD_MIN_SAVING` / `LEANARR_UHD_WINDOW` | `0.25` / `always` | 4K minimum saving / when a 4K encode may start |
 | `QBIT_URL`, `QBIT_USER`, `QBIT_PASSWORD` | | qBittorrent WebUI (4.x and 5.x) |
 | `SONARR_URL`, `SONARR_API_KEY`, `RADARR_URL`, `RADARR_API_KEY` | | for the rescan after a replacement |
 | `LEANARR_DB`, `LEANARR_WORK_DIR`, `LEANARR_PORT` | `/config/leanarr.db`, `/work`, `8282` | storage / port |
@@ -133,4 +155,4 @@ Developer and AI-agent guide: [CLAUDE.md](CLAUDE.md). Bug reports and ideas are 
 [contribution guide](https://github.com/H0m3Lab/.github/blob/main/CONTRIBUTING.md). Report security
 problems privately through the **Security** tab.
 
-License: MIT · Status: early (0.2). Back up your library before letting any tool rewrite it.
+License: MIT · Status: early. Back up your library before letting any tool rewrite it.

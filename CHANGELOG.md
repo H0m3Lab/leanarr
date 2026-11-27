@@ -6,6 +6,21 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-26
+
+### Added
+- 4K mode (`uhd_mode`: off / report / shrink, default off). 4K files above `uhd_min_mbps` (default 30, i.e.
+  remux / Blu-ray size) are re-encoded with x265 on the server's CPU, never by remote GPU workers. Quality
+  first: test samples are encoded from `uhd_crf_start` down to `uhd_crf_min` until every sample reaches the
+  VMAF 4K target (`uhd_vmaf`, default 95); after the full encode three other points are measured again. Below
+  target, or a saving under `uhd_min_saving`, the original stays. HDR10 signalling and static metadata are
+  carried over; Dolby Vision via dovi_tool (profile 7 → 8.1, profile 8 as is; profile 5 and HLG are skipped),
+  frame counts of picture and Dolby Vision data must match. Own hours (`uhd_window`).
+- The image now builds Netflix vmaf (v3.2.1) and dovi_tool (2.3.4) from their sources and adds mkvmerge.
+
+### Changed
+- Base image Debian 13 (trixie): ffmpeg 7.1 instead of 5.1.
+
 ## [0.4.0] - 2026-11-26
 
 ### Added
@@ -57,7 +72,8 @@ First public release.
 - Docker image, example Compose file, `.env.example`, MIT license.
 - Project docs (CLAUDE.md, this changelog) and CI (lint, Docker build, secret scan).
 
-[Unreleased]: https://github.com/H0m3Lab/leanarr/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/H0m3Lab/leanarr/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/H0m3Lab/leanarr/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/H0m3Lab/leanarr/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/H0m3Lab/leanarr/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/H0m3Lab/leanarr/compare/v0.2.0...v0.2.1

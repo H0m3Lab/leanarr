@@ -25,10 +25,16 @@ One Python process (`leanarr.py`), standard library only:
 - **Verify and replace:** `verify()` checks codec, duration (±1 s), audio/subtitle track counts, and
   minimum saving; `finalize()` copies to a hidden `.part` next to the original, renames over it, and
   asks Sonarr/Radarr to rescan (`arr_rescan()`).
-- **Dolby track (optional):** `audio_decide()` marks DTS-only MKVs (`audio_status` column, separate from the
-  shrink `status`); `dolby_worker()` takes the longest first and `add_dolby_track()` writes a `.part` next to
-  the original with `dolby_cmd()`, checks it with `dolby_verify()`, re-checks seeding, then renames it over
-  the original. It never runs on a file a shrink job is working on (and the other way round).
+- **Audio step (optional):** `audio_plan()` / `audio_decide()` decide per MKV (from the `atracks` column) whether
+  to add a Dolby track made from DTS and drop commentary / other-language tracks (`audio_status` column, separate
+  from the shrink `status`); `audio_worker()` takes the longest first and `tidy_file()` writes a `.part` next to
+  the original with `tidy_cmd()`, checks it with `tidy_verify()`, re-checks seeding, then renames it over the
+  original. `finalize()` runs the same step while a shrunk file is copied in. It never runs on a file a shrink
+  job is working on (and the other way round).
+- **4K mode (optional):** `decide_uhd()` marks 4K files above the bitrate floor (`uhd` column = 1; only
+  `uhd_worker()` takes them, `next_candidate(uhd=1)`). `uhd_encode()`: `uhd_pick_crf()` (samples + `vmaf_score()`
+  via FIFOs and the `vmaf` CLI), full x265 encode, Dolby Vision RPU with dovi_tool + mkvmerge, final VMAF + HDR/DV
+  check, then `finalize()`. Results below target return `kept: ...` (status `kept`, never retried unless the file changes).
 - **Web UI:** `Web` (`ThreadingHTTPServer`) serves the status page, `/report.json`, `/settings`,
   `/worker-setup`, `/health`, and the worker API on `LEANARR_PORT` (8282).
 
@@ -38,7 +44,7 @@ One Python process (`leanarr.py`), standard library only:
 leanarr.py                  the app: scanner, seed protection, encoder, verify/replace, web UI, worker API
 leanarr_worker.py           remote worker (any OS with Python 3 + ffmpeg)
 Setup-LeanarrWorker.ps1     one-line Windows worker installer served by /worker-setup
-Dockerfile                  python:3.12-slim + ffmpeg
+Dockerfile                  python:3.12-slim-trixie + ffmpeg + mkvtoolnix; builds vmaf and dovi_tool
 docker-compose.example.yml  copy to docker-compose.yml (git-ignored)
 seed_rules.example.json     copy to seed_rules.json (git-ignored); real tracker rules never go in git
 .env.example                secrets template

@@ -14,6 +14,8 @@ verified and clearly smaller.
   * optional audio step for MKVs: add a Dolby (E-AC-3 / AC-3) track made from the DTS track when no kept track is
     Dolby (for TVs/PCs that can't play DTS), and remove commentary / other-language tracks; same seeding protection,
     verify and safe replace (done during a shrink too, so a file is rewritten once)
+  * optional 4K mode: 4K files above a bitrate floor (remux size) are re-encoded with x265 on this server, keeping
+    HDR10 and Dolby Vision (dovi_tool), and kept only if their measured quality (VMAF) reaches the target
 
 Run:  python3 leanarr.py            (daemon: web UI + API + scanner + local worker)
       python3 leanarr.py --scan     (one scan, print the report, exit)
@@ -24,7 +26,7 @@ import argparse, datetime as dt, html, json, os, re, shlex, shutil, sqlite3, sub
 import urllib.error, urllib.parse, urllib.request, http.cookiejar
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 
 def env(name, default):
@@ -105,8 +107,32 @@ SETTINGS = {
     "drop_commentary": (env("LEANARR_DROP_COMMENTARY", "false"), "bool", "Remove commentary tracks",
                         "Remove audio and subtitle tracks marked or titled as commentary from MKV files. A file is never "
                         "left without audio."),
+    "uhd_mode": (env("LEANARR_UHD_MODE", "off"), ["off", "report", "shrink"], "4K mode",
+                 "4K files are normally left alone (already HEVC). 'shrink' re-encodes 4K files above the bitrate "
+                 "below with x265 on this server's CPU, keeping HDR10 / Dolby Vision, and keeps a result only if "
+                 "its measured picture quality (VMAF) reaches the target. 'report' only lists them."),
+    "uhd_min_mbps": (env("LEANARR_UHD_MIN_MBPS", "30"), "int:5:200", "4K: only files above (Mbps)",
+                     "Remux / Blu-ray size. Streaming rips (13-30 Mbps) are already compressed; a second pass "
+                     "saves little and is where visible loss starts."),
+    "uhd_vmaf": (env("LEANARR_UHD_VMAF", "95"), "float:80:100", "4K: minimum quality (VMAF 4K)",
+                 "95 = no visible difference for most people on a TV. Checked on test samples before the encode "
+                 "and again on the finished file; below it the original stays."),
+    "uhd_crf_start": (env("LEANARR_UHD_CRF_START", "20"), "int:10:30", "4K: first x265 CRF to try",
+                      "Leanarr tries this, then 2 lower (better) at a time down to the minimum, until the samples "
+                      "reach the quality target."),
+    "uhd_crf_min": (env("LEANARR_UHD_CRF_MIN", "14"), "int:8:30", "4K: lowest x265 CRF", ""),
+    "uhd_preset": (env("LEANARR_UHD_PRESET", "slow"), ["medium", "slow", "slower"], "4K: x265 speed preset",
+                   "slow on a 16-core CPU: roughly a day per movie."),
+    "uhd_x265_params": (env("LEANARR_UHD_X265_PARAMS", "aq-mode=3:no-sao=1"), "text", "4K: extra x265 params",
+                        "Colon-separated, added to -x265-params. aq-mode=3 helps dark scenes, no-sao keeps grain."),
+    "uhd_min_saving": (env("LEANARR_UHD_MIN_SAVING", "0.25"), "float:0:0.9", "4K: minimum saving",
+                       "Skip the full encode if the samples say it saves less than this (0.25 = 25%)."),
+    "uhd_window": (env("LEANARR_UHD_WINDOW", "always"), "text", "4K encode hours",
+                   "HH:MM-HH:MM, 'always' or 'never'. When a 4K encode may START (a running one finishes)."),
 }
 DOLBY_CODECS = ("ac3", "eac3", "truehd")
+UHD_WIDTH = 3000
+VMAF_MODEL = env("LEANARR_VMAF_MODEL", "/opt/vmaf/vmaf_4k_v0.6.1.json")
 COMMENTARY = re.compile(r"(?i)comment")
 
 VIDEO_EXT = re.compile(r"(?i)\.(mkv|mp4|m4v|avi|mov|wmv|mpg|mpeg|ts|m2ts|vob|flv|webm)$")
@@ -160,7 +186,7 @@ def init_db():
         cols = {r[1] for r in c.execute("pragma table_info(files)")}
         for col, typ in (("worker", "text"), ("lease_until", "real"), ("layout_ok", "integer"),
                          ("acodecs", "text"), ("audio_status", "text"), ("audio_reason", "text"),
-                         ("atracks", "text")):
+                         ("atracks", "text"), ("dv_profile", "integer"), ("uhd", "integer")):
             if col not in cols:
                 c.execute(f"alter table files add column {col} {typ}")
 
@@ -215,20 +241,40 @@ def hdr_kind(v):
     return ""
 
 
-def decide(vcodec, hdr, duration, layout_ok, size):
-    """Status from stored facts + current settings (so a settings change needs no re-probe)."""
-    skip_codecs = {x.strip() for x in S("skip_codecs").split(",") if x.strip()}
+def decide(f, size):
+    """(status, reason, est_saving, uhd) from stored facts + current settings (a settings change needs no re-probe).
+    f: vcodec, hdr, duration, layout_ok, width, dv_profile (a probe_fields() dict or a files row)."""
+    vcodec, hdr, duration = f["vcodec"], f["hdr"], f["duration"]
+    layout_ok = 1 if f["layout_ok"] is None else f["layout_ok"]
     if not vcodec:
-        return "skip", "no video stream", 0
-    if vcodec in skip_codecs:
-        return "skip", f"already {vcodec}", 0
-    if hdr and S_bool("skip_hdr"):
-        return "skip", f"{hdr} (kept as is)", 0
+        return "skip", "no video stream", 0, 0
     if not duration:
-        return "skip", "unknown duration", 0
+        return "skip", "unknown duration", 0, 0
     if not layout_ok:
-        return "skip", "unusual stream layout (cover art before the video)", 0
-    return "candidate", f"{vcodec} -> hevc", int(size * EST_SAVING.get(vcodec, 0.4))
+        return "skip", "unusual stream layout (cover art before the video)", 0, 0
+    if (f["width"] or 0) >= UHD_WIDTH:
+        return decide_uhd(f, size)
+    skip_codecs = {x.strip() for x in S("skip_codecs").split(",") if x.strip()}
+    if vcodec in skip_codecs:
+        return "skip", f"already {vcodec}", 0, 0
+    if hdr and S_bool("skip_hdr"):
+        return "skip", f"{hdr} (kept as is)", 0, 0
+    return "candidate", f"{vcodec} -> hevc", int(size * EST_SAVING.get(vcodec, 0.4)), 0
+
+
+def decide_uhd(f, size):
+    """4K: only the 4K mode may re-encode, only above the bitrate floor, never Dolby Vision profile 5."""
+    mbps = size * 8 / f["duration"] / 1e6
+    if S("uhd_mode") == "off":
+        return "skip", "4K (4K mode off)", 0, 0
+    if mbps < int(S("uhd_min_mbps")):
+        return "skip", f"4K below {S('uhd_min_mbps')} Mbps (kept as is)", 0, 0
+    if f["dv_profile"] == 5:
+        return "skip", "4K Dolby Vision profile 5 (kept as is)", 0, 0
+    if f["hdr"] == "HLG":
+        return "skip", "4K HLG (kept as is)", 0, 0
+    est = int(size * max(0.0, 1 - 28 / mbps))   # finished 4K encodes land around 20-35 Mbps
+    return "candidate", f"4K {mbps:.0f} Mbps {f['hdr'] or 'SDR'} -> x265 (quality-checked)", est, 1
 
 
 def probe_fields(info):
@@ -246,7 +292,14 @@ def probe_fields(info):
             "sub_n": sum(1 for s in streams if s.get("codec_type") == "subtitle"),
             "layout_ok": 1 if (v is not None and first_video is v) else 0,
             "acodecs": ",".join(s.get("codec_name") or "?" for s in streams if s.get("codec_type") == "audio"),
-            "atracks": json.dumps(track_facts(streams))}
+            "atracks": json.dumps(track_facts(streams)), "dv_profile": dv_profile(v) if v else None}
+
+
+def dv_profile(v):
+    for sd in v.get("side_data_list") or []:
+        if "dv_profile" in sd:
+            return int(sd["dv_profile"])
+    return None
 
 
 def track_facts(streams):
@@ -337,13 +390,13 @@ def audio_reclassify(c, rows):
 def reclassify_all():
     """Apply changed settings to everything already probed (no re-probe needed)."""
     with db() as c:
-        rows = c.execute("select path, size, vcodec, hdr, duration, layout_ok, reason from files "
+        rows = c.execute("select path, size, vcodec, hdr, duration, layout_ok, width, dv_profile, reason from files "
                          "where status in ('candidate','skip') and vcodec is not null").fetchall()
         for r in rows:
             if r["reason"] and r["reason"].startswith(("smaller than", "sample/extras", "probe failed")):
                 continue
-            st, reason, est = decide(r["vcodec"], r["hdr"], r["duration"], r["layout_ok"] if r["layout_ok"] is not None else 1, r["size"])
-            c.execute("update files set status=?, reason=?, est_saving=? where path=?", (st, reason, est, r["path"]))
+            st, reason, est, uhd = decide(r, r["size"])
+            c.execute("update files set status=?, reason=?, est_saving=?, uhd=? where path=?", (st, reason, est, uhd, r["path"]))
         audio_reclassify(c, c.execute("select path, atracks, audio_status from files where atracks is not null "
                                       "and audio_status in ('candidate','skip','done')").fetchall())
 
@@ -449,7 +502,7 @@ def scan():
                 seen += 1
                 prev = known.get(p)
                 same = prev and prev[0] == st.st_size and prev[1] == st.st_mtime
-                if same and prev[2] in ("done", "failed", "too-small-gain", "working") and prev[3] is not None:
+                if same and prev[2] in ("done", "failed", "too-small-gain", "kept", "working") and prev[3] is not None:
                     continue
                 cols = None
                 if SKIP_PATH.search("/" + os.path.relpath(p, lib)):
@@ -468,9 +521,9 @@ def scan():
                     try:
                         f = probe_fields(ffprobe(p))
                         probed += 1
-                        status, reason, est = decide(f["vcodec"], f["hdr"], f["duration"], f["layout_ok"], st.st_size)
+                        status, reason, est, uhd = decide(f, st.st_size)
                         a_st, a_reason = audio_decide(p, f["atracks"])
-                        cols = {**f, "status": status, "reason": reason, "est_saving": est,
+                        cols = {**f, "status": status, "reason": reason, "est_saving": est, "uhd": uhd,
                                 "audio_status": a_st, "audio_reason": a_reason}
                     except Exception as e:
                         cols = {"status": "skip", "reason": f"probe failed: {e}"}
@@ -498,7 +551,10 @@ def scan():
                             c.execute("update files set status='protected', reason=? where path=?",
                                       ("used by a torrent" if qbit_ok else "qBittorrent unreachable", p))
                         elif row["status"] == "protected":
-                            c.execute("update files set status='candidate', reason=vcodec||' -> hevc' where path=?", (p,))
+                            r = c.execute("select * from files where path=?", (p,)).fetchone()
+                            s2, reason2, est2, uhd2 = decide(r, r["size"])
+                            c.execute("update files set status=?, reason=?, est_saving=?, uhd=? where path=?",
+                                      (s2, reason2, est2, uhd2, p))
                     arow = c.execute("select path, atracks, audio_status from files where path=?", (p,)).fetchone()
                     if arow and arow["audio_status"] in ("candidate", "protected"):
                         if not qbit_ok or os.path.normpath(p) in protected:
@@ -701,17 +757,18 @@ def record_result(row, result, who):
     if result == "done":
         return
     status = ("protected" if result.startswith("protected") else "too-small-gain" if result.startswith("too-small-gain")
-              else "skip" if result.startswith("skip") else "failed")
+              else "kept" if result.startswith("kept") else "skip" if result.startswith("skip") else "failed")
     with db() as c:
         c.execute("update files set status=?, reason=?, error=?, worker=?, lease_until=null where path=?",
                   (status, result[:300], result[:300] if status == "failed" else None, who, row["path"]))
     log(f"{status.upper()} [{who}]: {row['path']}: {result}")
 
 
-def next_candidate():
+def next_candidate(uhd=0):
+    """Best next shrink job. 4K jobs (uhd=1) only go to the 4K worker on this server, never to the others."""
     with db() as c:
         return c.execute("select rowid as id, * from files where status='candidate' and coalesce(audio_status,'')!='working' "
-                         "order by est_saving desc limit 1").fetchone()
+                         "and coalesce(uhd,0)=? order by est_saving desc limit 1", (uhd,)).fetchone()
 
 
 def local_worker(once=False):
@@ -894,6 +951,245 @@ def audio_worker():
             log(f"AUDIO {status.upper()}: {row['path']}: {result}")
 
 
+# ------------------------------------------------------------------ 4K mode (x265 on this server, quality-checked)
+def run(cmd, timeout=None):
+    """Run a command, raise with the end of its error output if it fails."""
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if p.returncode != 0:
+        name = cmd[3] if cmd[0] == "nice" else cmd[0]
+        raise RuntimeError(f"{os.path.basename(name)}: {(p.stderr or p.stdout).strip()[-300:]}")
+    return p
+
+
+def frac(x):
+    n, d = str(x).split("/") if "/" in str(x) else (x, 1)
+    return float(n) / float(d)
+
+
+def uhd_x265_params(path, v):
+    """x265 params that keep the source's colour signalling and HDR10 static metadata."""
+    params = []
+    for key, val in (("colorprim", v.get("color_primaries")), ("transfer", v.get("color_transfer")),
+                     ("colormatrix", v.get("color_space"))):
+        if val and val != "unknown":
+            params.append(f"{key}={val}")
+    if v.get("color_range") == "pc":
+        params.append("range=full")
+    if v.get("color_transfer") == "smpte2084":
+        params += ["hdr10=1", "hdr10-opt=1", "repeat-headers=1"]
+        out = run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-read_intervals", "%+#1", "-show_frames",
+                   "-of", "json", path], timeout=300).stdout
+        frame = (json.loads(out).get("frames") or [{}])[0]
+        for sd in frame.get("side_data_list") or []:
+            try:
+                if sd.get("side_data_type") == "Mastering display metadata":
+                    c = lambda k: round(frac(sd[k]) * 50000)  # noqa: E731  (x265 units: 0.00002)
+                    lum = lambda k: round(frac(sd[k]) * 10000)  # noqa: E731  (x265 units: 0.0001 cd/m2)
+                    params.append(f"master-display=G({c('green_x')},{c('green_y')})B({c('blue_x')},{c('blue_y')})"
+                                  f"R({c('red_x')},{c('red_y')})WP({c('white_point_x')},{c('white_point_y')})"
+                                  f"L({lum('max_luminance')},{lum('min_luminance')})")
+                elif sd.get("side_data_type") == "Content light level metadata":
+                    params.append(f"max-cll={int(sd['max_content'])},{int(sd['max_average'])}")
+            except (KeyError, ValueError, ZeroDivisionError):
+                pass
+    extra = [x for x in (S("uhd_x265_params") or "").split(":") if x.strip()]
+    return ":".join(params + extra + ["log-level=error"])
+
+
+def uhd_video_args(crf, x265_params):
+    return ["-c:v:0", "libx265", "-preset", S("uhd_preset"), "-crf", str(crf), "-x265-params", x265_params,
+            "-pix_fmt", "yuv420p10le", "-fps_mode", "passthrough"]
+
+
+def vmaf_score(src, t, length, dist, dist_t, work, tag):
+    """VMAF (4K model) of `dist` against the source over [t, t+length]: (mean, min, frames)."""
+    d = os.path.join(work, f"vmaf-{tag}")
+    os.makedirs(d, exist_ok=True)
+    ref_f, dis_f, out = os.path.join(d, "ref.y4m"), os.path.join(d, "dis.y4m"), os.path.join(d, "vmaf.json")
+    for f in (ref_f, dis_f, out):
+        if os.path.exists(f):
+            os.remove(f)
+    os.mkfifo(ref_f)
+    os.mkfifo(dis_f)
+    dec = lambda inp, ss, fifo: subprocess.Popen(  # noqa: E731
+        ["nice", "-n", CONFIG["nice"], "ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-ss", f"{ss:.3f}", "-i", inp,
+         "-t", f"{length:.3f}", "-map", "0:v:0", "-pix_fmt", "yuv420p10le", "-fps_mode", "passthrough",
+         "-strict", "-1", "-f", "yuv4mpegpipe",
+         "-y", fifo], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    pr, pd = dec(src, t, ref_f), dec(dist, dist_t, dis_f)
+    try:
+        run(["nice", "-n", CONFIG["nice"], "vmaf", "-r", ref_f, "-d", dis_f, "--model", f"path={VMAF_MODEL}",
+             "--threads", str(os.cpu_count() or 4), "--json", "-o", out, "-q"], timeout=3 * H)
+    finally:
+        for p in (pr, pd):
+            try:
+                p.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                p.kill()
+    res = json.load(open(out))
+    pooled = res["pooled_metrics"]["vmaf"]
+    shutil.rmtree(d, ignore_errors=True)
+    if pooled["mean"] < 70:   # no real encode at these settings scores this low: the frames did not line up
+        raise RuntimeError(f"VMAF {pooled['mean']:.0f} at {t:.0f} s: frames misaligned, measurement not usable")
+    return pooled["mean"], pooled["min"], len(res.get("frames") or [])
+
+
+def sample_points(duration, fractions, length):
+    return [max(0.0, min(duration - length - 1, duration * f)) for f in fractions]
+
+
+def non_video_bytes(info, duration):
+    """Bytes of everything but the main video, from the mkvmerge BPS tags (0 if unknown)."""
+    total = 0
+    for s in info["streams"]:
+        if s is main_video(info):
+            continue
+        bps = (s.get("tags") or {}).get("BPS") or (s.get("tags") or {}).get("BPS-eng") or s.get("bit_rate")
+        try:
+            total += int(bps) * duration / 8
+        except (TypeError, ValueError):
+            pass
+    return int(total)
+
+
+def uhd_pick_crf(src, row, x265_params, work, length):
+    """Encode test samples, step the CRF down until every sample reaches the VMAF target.
+    Returns (crf, est_new_size, scores) or (None, reason, scores)."""
+    target, dur = float(S("uhd_vmaf")), row["duration"]
+    pts = sample_points(dur, (0.2, 0.4, 0.6, 0.8), length)
+    crf, last = int(S("uhd_crf_start")), []
+    while crf >= int(S("uhd_crf_min")):
+        scores, size = [], 0
+        for i, t in enumerate(pts):
+            out = os.path.join(work, f"uhd-{row['id']}-sample{i}.mkv")
+            run(["nice", "-n", CONFIG["nice"], "ffmpeg", "-hide_banner", "-nostdin", "-y", "-v", "error", "-ss", f"{t:.3f}",
+                 "-i", src, "-t", f"{length:.3f}", "-map", "0:v:0", "-an", "-sn", "-dn"]
+                + uhd_video_args(crf, x265_params) + ["-f", "matroska", out], timeout=12 * H)
+            size += os.path.getsize(out)
+            mean, low, frames = vmaf_score(src, t, length, out, 0.0, work, f"{row['id']}-s{i}")
+            os.remove(out)
+            if frames < length * 20:   # < 20 fps worth of frames compared = misaligned / short read
+                raise RuntimeError(f"VMAF compared only {frames} frames of a {length:.0f} s sample")
+            scores.append(round(mean, 2))
+        mbps = size * 8 / (len(pts) * length) / 1e6
+        last = scores
+        log(f"  4K test CRF {crf}: VMAF {min(scores)}-{max(scores)} (target {target:g}), video ~{mbps:.0f} Mbps")
+        if min(scores) >= target:
+            return crf, int(mbps * 1e6 / 8 * dur), scores
+        crf -= 2
+    return None, f"quality target VMAF {target:g} not reached even at CRF {S('uhd_crf_min')}", last
+
+
+def uhd_encode(row):
+    """One 4K file: pick the CRF on samples, encode, keep Dolby Vision, check quality again, safe replace."""
+    src = row["path"]
+    why = precheck(row)
+    if why:
+        return why
+    info = ffprobe(src)
+    v = main_video(info)
+    f = probe_fields(info)
+    if f["dv_profile"] == 5:
+        return "skip: Dolby Vision profile 5 (kept as is)"
+    work = CONFIG["work_dir"]
+    os.makedirs(work, exist_ok=True)
+    tmp = os.path.join(work, f"uhd-{row['id']}.mkv")
+    hevc, hevc_dv, rpu = tmp + ".hevc", tmp + ".dv.hevc", tmp + ".rpu"
+    t0 = time.time()
+    try:
+        x265_params = uhd_x265_params(src, v)
+        length = min(15.0, row["duration"] / 20)
+        log(f"4K START [x265 {S('uhd_preset')}] {src} ({gb(row['size'])}, {f['hdr'] or 'SDR'}"
+            f"{' P' + str(f['dv_profile']) if f['dv_profile'] else ''})")
+        crf, est, scores = uhd_pick_crf(src, row, x265_params, work, length)
+        if crf is None:
+            return f"kept: {est} (samples {scores})"
+        nonvid = non_video_bytes(info, row["duration"])
+        if est + nonvid > row["size"] * (1 - float(S("uhd_min_saving"))):
+            return f"too-small-gain: samples say {(est + nonvid) / row['size']:.0%} of the original at CRF {crf}"
+        free = shutil.disk_usage(work).free
+        if free < 3 * (est + nonvid) + 20e9:
+            return f"skip: not enough scratch space ({gb(free)} free)"
+        log(f"4K ENCODE CRF {crf} (samples VMAF {scores}, expect ~{gb(est + nonvid)}): {src}")
+        if f["dv_profile"]:
+            # Dolby Vision: take the RPU (profile 7 -> 8.1), encode the picture, put the RPU back, mux with mkvmerge
+            ext = subprocess.Popen(["nice", "-n", CONFIG["nice"], "ffmpeg", "-hide_banner", "-nostdin", "-v", "error",
+                                    "-i", src, "-map", "0:v:0", "-c:v", "copy", "-bsf:v", "hevc_mp4toannexb", "-f", "hevc", "-"],
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            dv = subprocess.run(["dovi_tool"] + (["-m", "2"] if f["dv_profile"] == 7 else []) + ["extract-rpu", "-", "-o", rpu],
+                                stdin=ext.stdout, capture_output=True, text=True)
+            ext.stdout.close()
+            ext.wait()
+            if dv.returncode != 0 or not os.path.exists(rpu):
+                return f"failed: dovi_tool extract-rpu: {(dv.stderr or dv.stdout).strip()[-200:]}"
+            run(["nice", "-n", CONFIG["nice"], "ffmpeg", "-hide_banner", "-nostdin", "-y", "-v", "error", "-i", src,
+                 "-map", "0:v:0"] + uhd_video_args(crf, x265_params) + ["-f", "hevc", hevc])
+            run(["dovi_tool", "inject-rpu", "-i", hevc, "--rpu-in", rpu, "-o", hevc_dv])
+            os.remove(hevc)
+            n_rpu = re.search(r"Frames:\s*(\d+)", run(["dovi_tool", "info", "-i", rpu, "--summary"]).stdout)
+            n_vid = run(["ffprobe", "-v", "error", "-count_packets", "-select_streams", "v:0", "-show_entries",
+                         "stream=nb_read_packets", "-of", "csv=p=0", hevc_dv], timeout=3 * H).stdout.strip()
+            if not n_rpu or int(n_rpu.group(1)) != int(n_vid or 0):
+                return f"failed: Dolby Vision frame count differs (RPU {n_rpu.group(1) if n_rpu else '?'}, video {n_vid})"
+            tags = v.get("tags") or {}
+            mk = ["mkvmerge", "-q", "-o", tmp, "--default-duration", f"0:{v.get('r_frame_rate') or '24000/1001'}p",
+                  "--language", f"0:{tags.get('language') or 'und'}"]
+            if tags.get("title"):
+                mk += ["--track-name", f"0:{tags['title']}"]
+            p = subprocess.run(mk + [hevc_dv, "--no-video", src], capture_output=True, text=True)
+            if p.returncode not in (0, 1):   # 1 = warnings only
+                return f"failed: mkvmerge: {(p.stdout + p.stderr).strip()[-200:]}"
+            os.remove(hevc_dv)
+        else:
+            run(["nice", "-n", CONFIG["nice"], "ffmpeg", "-hide_banner", "-nostdin", "-y", "-loglevel", "error", "-i", src]
+                + stream_args(info, True) + uhd_video_args(crf, x265_params)
+                + ["-max_muxing_queue_size", "4096", "-f", "matroska", tmp])
+        # quality + metadata check of the finished file, at points the samples did not cover
+        out_info = ffprobe(tmp)
+        ov = main_video(out_info)
+        if ov.get("color_transfer") != v.get("color_transfer"):
+            return f"failed: HDR signalling lost ({ov.get('color_transfer')} vs {v.get('color_transfer')})"
+        if f["dv_profile"] and dv_profile(ov) != 8:
+            return f"failed: Dolby Vision lost (output profile {dv_profile(ov)})"
+        final = []
+        for i, t in enumerate(sample_points(row["duration"], (0.3, 0.5, 0.7), length)):
+            mean, low, frames = vmaf_score(src, t, length, tmp, t, work, f"{row['id']}-f{i}")
+            if frames < length * 20:
+                return f"failed: final VMAF compared only {frames} frames"
+            final.append(round(mean, 2))
+        if min(final) < float(S("uhd_vmaf")) - 1:
+            return f"kept: finished file scored VMAF {final} (target {S('uhd_vmaf')})"
+        log(f"4K CHECKED VMAF {final}, {gb(os.path.getsize(tmp))}: {src}")
+        return finalize(row, tmp, t0, "4K")
+    finally:
+        for x in (tmp, hevc, hevc_dv, rpu):
+            if os.path.exists(x):
+                os.remove(x)
+
+
+def uhd_worker():
+    with db() as c:   # a 4K job that was running when Leanarr stopped goes back into the queue
+        c.execute("update files set status='candidate', worker=null, lease_until=null where status='working' and worker='4K'")
+    while True:
+        if S("uhd_mode") != "shrink" or not in_window(S("uhd_window")):
+            time.sleep(60)
+            continue
+        with CLAIM_LOCK:
+            row = next_candidate(uhd=1)
+            if row:
+                with db() as c:
+                    c.execute("update files set status='working', worker='4K', lease_until=? where path=?",
+                              (time.time() + 14 * 24 * H, row["path"]))
+        if not row:
+            time.sleep(600)
+            continue
+        try:
+            result = uhd_encode(row)
+        except Exception as e:
+            result = f"failed: {e}"
+        record_result(row, result, "4K")
+
+
 # ------------------------------------------------------------------ remote worker API
 def worker_seen(name, kind, version, addr, note):
     with db() as c:
@@ -1006,7 +1302,8 @@ def status_page():
                  f"<div class='cards'>{dcards}</div>"
                  f"<div class='scroll'><table>{drows}</table></div>")
     body = (f"<h1>Leanarr <small>mode <b>{S('mode')}</b> · local CPU {'on' if S_bool('local_worker') else 'off'} "
-            f"({S('window')}) · remote workers {'on' if CONFIG['worker_token'] else 'off'} ({S('remote_window')})</small></h1>{warn}"
+            f"({S('window')}) · remote workers {'on' if CONFIG['worker_token'] else 'off'} ({S('remote_window')}) "
+            f"· 4K <b>{S('uhd_mode')}</b> ({esc(S('uhd_window'))}, VMAF ≥ {S('uhd_vmaf')})</small></h1>{warn}"
             f"<div class='cards'>{cards}</div>{dolby}"
             f"<h2>Workers</h2><div class='scroll'><table>{wk}</table></div>"
             f"<h2>Working on</h2><div class='scroll'><table>{working}</table></div>"
@@ -1092,7 +1389,7 @@ def save_settings(form):
                         raise ValueError
                 except ValueError:
                     errors.append(f"{label}: must be a number between {lo} and {hi}"); continue
-            if key in ("window", "remote_window", "dolby_window") and v.lower() not in ("always", "never", "none", "off")                     and not re.fullmatch(r"\d\d:\d\d-\d\d:\d\d", v):
+            if key in ("window", "remote_window", "dolby_window", "uhd_window") and v.lower() not in ("always", "never", "none", "off")                     and not re.fullmatch(r"\d\d:\d\d-\d\d:\d\d", v):
                 errors.append(f"{label}: use HH:MM-HH:MM, 'always' or 'never'"); continue
             if key == "audio_languages":
                 v = ",".join(x.strip().lower() for x in v.split(",") if x.strip())
@@ -1251,6 +1548,7 @@ def main():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     threading.Thread(target=local_worker, daemon=True).start()
     threading.Thread(target=audio_worker, daemon=True).start()
+    threading.Thread(target=uhd_worker, daemon=True).start()
     while True:
         ok = True
         try:
