@@ -41,7 +41,7 @@ track's channels (max 5.1), so a stereo commentary in AC-3 no longer stops the n
 
 4K files are already HEVC, so the normal shrink leaves them alone. With `LEANARR_UHD_MODE=shrink`, 4K files
 above `LEANARR_UHD_MIN_MBPS` (default 30 Mbps, remux / Blu-ray size; streaming rips stay as they are) are
-re-encoded with x265 on the server's own CPU (remote GPU workers never get them), quality first:
+re-encoded with x265 on the server's own CPU or on a 4K worker PC (remote GPU workers never get them), quality first:
 
 1. Four short test samples are encoded at `LEANARR_UHD_CRF_START` (20); the CRF goes down 2 at a time to
    `LEANARR_UHD_CRF_MIN` (14) until every sample reaches the VMAF 4K target `LEANARR_UHD_VMAF` (95 = no visible
@@ -52,7 +52,11 @@ re-encoded with x265 on the server's own CPU (remote GPU workers never get them)
 3. Three other points of the finished file are measured again (VMAF ≥ target − 1), HDR / Dolby Vision must still
    be there, then the usual verify, seeding re-check and safe replace. Audio, subtitles and chapters are copied.
 
-Slow by design: roughly a day per movie on a 16-core CPU with `slow`.
+Slow by design: several days per movie on an older 16-core server CPU with `slow`. A **4K worker PC** can take the
+heavy part instead: on the PC with a fast CPU, run the 4K command from `/worker-setup` (`-Kind uhd`; installs an ffmpeg
+build with libx265 + libvmaf and checks it). The PC then runs the samples, the encode and the quality checks and uploads
+only the new picture; the server adds the Dolby Vision data and the other tracks back and does the usual checks and
+safe replace. Set `LEANARR_UHD_LOCAL=false` to keep the server out of 4K encoding completely.
 
 ### Removing commentary and other-language tracks (optional)
 
@@ -85,6 +89,7 @@ Status page: `http://<host>:8282` (also `/report.json`).
 | `LEANARR_UHD_CRF_START` / `LEANARR_UHD_CRF_MIN` / `LEANARR_UHD_PRESET` | `20` / `14` / `slow` | 4K x265 CRF search range and preset |
 | `LEANARR_UHD_X265_PARAMS` | `aq-mode=3:no-sao=1` | extra x265 params for 4K |
 | `LEANARR_UHD_MIN_SAVING` / `LEANARR_UHD_WINDOW` | `0.25` / `always` | 4K minimum saving / when a 4K encode may start |
+| `LEANARR_UHD_LOCAL` | `true` | 4K encodes on this server too; `false` = only on 4K worker PCs |
 | `QBIT_URL`, `QBIT_USER`, `QBIT_PASSWORD` | | qBittorrent WebUI (4.x and 5.x) |
 | `SONARR_URL`, `SONARR_API_KEY`, `RADARR_URL`, `RADARR_API_KEY` | | for the rescan after a replacement |
 | `LEANARR_DB`, `LEANARR_WORK_DIR`, `LEANARR_PORT` | `/config/leanarr.db`, `/work`, `8282` | storage / port |

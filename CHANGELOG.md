@@ -6,6 +6,31 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-27
+
+### Added
+- 4K worker PCs (worker kind `uhd`, `Setup-LeanarrWorker.ps1 -Kind uhd`): a PC with a fast CPU does the 4K mode's
+  heavy work (test samples, x265 encode, VMAF checks with ffmpeg's libvmaf) and uploads only the new picture. The
+  server keeps the light steps: seeding checks, the Dolby Vision data (taken from the original and put into the new
+  stream), adding audio/subtitles/chapters back with mkvmerge, verify and the safe replace. It can run next to a GPU
+  worker on the same PC (own task, work folder, log and name `<PC>-4K`), keeps the PC awake during a job, runs at
+  below-normal priority and reports progress and speed (fps, hours left) to the status page.
+- `uhd_local` (default true): off = 4K encodes only on 4K worker PCs, never on the server.
+
+### Changed
+- 4K files are now always assembled with mkvmerge (encoded picture + every other track of the original), with or
+  without Dolby Vision.
+
+### Fixed
+- 4K: ffmpeg 7+ copied the source's Dolby Vision data into the x265 encode by itself, so Dolby Vision files could end
+  up with two sets of it. Encodes now run with `-dolbyvision 0`; the data is only added by dovi_tool (converted and
+  frame-checked).
+- When qBittorrent answered slowly, a worker gave up waiting for its job and asked again; the server still handed
+  out each job, so one worker ended up holding many jobs at once. A job the worker never received now goes straight
+  back into the queue.
+- A 4K file Leanarr had already re-encoded was offered again on the next scan (it is still 4K above the bitrate
+  floor). The scan now recognises its own finished files ("4K: already re-encoded by Leanarr").
+
 ## [0.5.0] - 2026-11-26
 
 ### Added
@@ -72,7 +97,8 @@ First public release.
 - Docker image, example Compose file, `.env.example`, MIT license.
 - Project docs (CLAUDE.md, this changelog) and CI (lint, Docker build, secret scan).
 
-[Unreleased]: https://github.com/H0m3Lab/leanarr/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/H0m3Lab/leanarr/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/H0m3Lab/leanarr/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/H0m3Lab/leanarr/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/H0m3Lab/leanarr/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/H0m3Lab/leanarr/compare/v0.2.1...v0.3.0

@@ -26,7 +26,7 @@ import argparse, datetime as dt, html, json, os, re, shlex, shutil, sqlite3, sub
 import urllib.error, urllib.parse, urllib.request, http.cookiejar
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 
 
 def env(name, default):
@@ -109,8 +109,12 @@ SETTINGS = {
                         "left without audio."),
     "uhd_mode": (env("LEANARR_UHD_MODE", "off"), ["off", "report", "shrink"], "4K mode",
                  "4K files are normally left alone (already HEVC). 'shrink' re-encodes 4K files above the bitrate "
-                 "below with x265 on this server's CPU, keeping HDR10 / Dolby Vision, and keeps a result only if "
-                 "its measured picture quality (VMAF) reaches the target. 'report' only lists them."),
+                 "below with x265 (on this server and/or a 4K worker PC), keeping HDR10 / Dolby Vision, and keeps a "
+                 "result only if its measured picture quality (VMAF) reaches the target. 'report' only lists them."),
+    "uhd_local": (env("LEANARR_UHD_LOCAL", "true"), "bool", "4K: encode on this server too",
+                  "Off = only 4K worker PCs (worker kind 'uhd') do the heavy part: test samples, quality measurement "
+                  "and the encode. This server then only does the light steps (seeding checks, Dolby Vision data, "
+                  "putting audio/subtitles back, the safe replace)."),
     "uhd_min_mbps": (env("LEANARR_UHD_MIN_MBPS", "30"), "int:5:200", "4K: only files above (Mbps)",
                      "Remux / Blu-ray size. Streaming rips (13-30 Mbps) are already compressed; a second pass "
                      "saves little and is where visible loss starts."),
@@ -132,6 +136,7 @@ SETTINGS = {
 }
 DOLBY_CODECS = ("ac3", "eac3", "truehd")
 UHD_WIDTH = 3000
+UHD_LEASE = 3 * 24 * 3600   # 4K worker jobs; every progress report extends it
 VMAF_MODEL = env("LEANARR_VMAF_MODEL", "/opt/vmaf/vmaf_4k_v0.6.1.json")
 COMMENTARY = re.compile(r"(?i)comment")
 
@@ -485,6 +490,9 @@ def scan():
         audio_reclassify(c, c.execute("select path, atracks, audio_status from files where audio_status='wait'").fetchall())
         known = {r["path"]: (r["size"], r["mtime"], r["status"], r["atracks"], r["audio_status"])
                  for r in c.execute("select path,size,mtime,status,atracks,audio_status from files")}
+        # files Leanarr itself wrote: a finished 4K re-encode is still 4K above the floor and must not come back
+        own = {r["new_path"]: r["new_size"] for r in c.execute(
+            "select new_path, new_size from files where status='done' and new_path is not null")}
     min_bytes = int(S("min_size_mb")) * 1024 * 1024
     on_disk = set()
     for lib in CONFIG["libraries"]:
@@ -522,6 +530,8 @@ def scan():
                         f = probe_fields(ffprobe(p))
                         probed += 1
                         status, reason, est, uhd = decide(f, st.st_size)
+                        if uhd and own.get(p) == st.st_size:
+                            status, reason, est, uhd = "skip", "4K: already re-encoded by Leanarr", 0, 0
                         a_st, a_reason = audio_decide(p, f["atracks"])
                         cols = {**f, "status": status, "reason": reason, "est_saving": est, "uhd": uhd,
                                 "audio_status": a_st, "audio_reason": a_reason}
@@ -996,9 +1006,11 @@ def uhd_x265_params(path, v):
     return ":".join(params + extra + ["log-level=error"])
 
 
-def uhd_video_args(crf, x265_params):
-    return ["-c:v:0", "libx265", "-preset", S("uhd_preset"), "-crf", str(crf), "-x265-params", x265_params,
-            "-pix_fmt", "yuv420p10le", "-fps_mode", "passthrough"]
+def uhd_video_args(crf, plan):
+    # -dolbyvision 0: ffmpeg 7+ would copy the source's Dolby Vision data into the encode by itself; uhd_assemble()
+    # adds it with dovi_tool (converted, frame-checked), so the encode must be plain HDR10
+    return ["-c:v:0", "libx265", "-preset", plan["preset"], "-crf", str(crf), "-x265-params", plan["x265_params"],
+            "-dolbyvision", "0", "-pix_fmt", "yuv420p10le", "-fps_mode", "passthrough"]
 
 
 def vmaf_score(src, t, length, dist, dist_t, work, tag):
@@ -1052,118 +1064,169 @@ def non_video_bytes(info, duration):
     return int(total)
 
 
-def uhd_pick_crf(src, row, x265_params, work, length):
+def uhd_pick_crf(src, jid, plan, work):
     """Encode test samples, step the CRF down until every sample reaches the VMAF target.
-    Returns (crf, est_new_size, scores) or (None, reason, scores)."""
-    target, dur = float(S("uhd_vmaf")), row["duration"]
-    pts = sample_points(dur, (0.2, 0.4, 0.6, 0.8), length)
-    crf, last = int(S("uhd_crf_start")), []
-    while crf >= int(S("uhd_crf_min")):
+    Returns (crf, est_video_bytes, scores) or (None, reason, scores)."""
+    target, length, crf, last = plan["vmaf"], plan["length"], plan["crf_start"], []
+    while crf >= plan["crf_min"]:
         scores, size = [], 0
-        for i, t in enumerate(pts):
-            out = os.path.join(work, f"uhd-{row['id']}-sample{i}.mkv")
+        for i, t in enumerate(plan["samples"]):
+            out = os.path.join(work, f"uhd-{jid}-sample{i}.mkv")
             run(["nice", "-n", CONFIG["nice"], "ffmpeg", "-hide_banner", "-nostdin", "-y", "-v", "error", "-ss", f"{t:.3f}",
                  "-i", src, "-t", f"{length:.3f}", "-map", "0:v:0", "-an", "-sn", "-dn"]
-                + uhd_video_args(crf, x265_params) + ["-f", "matroska", out], timeout=12 * H)
+                + uhd_video_args(crf, plan) + ["-f", "matroska", out], timeout=12 * H)
             size += os.path.getsize(out)
-            mean, low, frames = vmaf_score(src, t, length, out, 0.0, work, f"{row['id']}-s{i}")
+            mean, low, frames = vmaf_score(src, t, length, out, 0.0, work, f"{jid}-s{i}")
             os.remove(out)
             if frames < length * 20:   # < 20 fps worth of frames compared = misaligned / short read
                 raise RuntimeError(f"VMAF compared only {frames} frames of a {length:.0f} s sample")
             scores.append(round(mean, 2))
-        mbps = size * 8 / (len(pts) * length) / 1e6
+        mbps = size * 8 / (len(plan["samples"]) * length) / 1e6
         last = scores
         log(f"  4K test CRF {crf}: VMAF {min(scores)}-{max(scores)} (target {target:g}), video ~{mbps:.0f} Mbps")
         if min(scores) >= target:
-            return crf, int(mbps * 1e6 / 8 * dur), scores
+            return crf, int(mbps * 1e6 / 8 * plan["duration"]), scores
         crf -= 2
-    return None, f"quality target VMAF {target:g} not reached even at CRF {S('uhd_crf_min')}", last
+    return None, f"quality target VMAF {target:g} not reached even at CRF {plan['crf_min']}", last
 
 
-def uhd_encode(row):
-    """One 4K file: pick the CRF on samples, encode, keep Dolby Vision, check quality again, safe replace."""
-    src = row["path"]
+def uhd_prepare(row):
+    """Checks + the encode settings for one 4K file (the same for this server and a 4K worker PC).
+    Returns (plan, None) or (None, reason)."""
     why = precheck(row)
     if why:
-        return why
-    info = ffprobe(src)
-    v = main_video(info)
+        return None, why
+    info = ffprobe(row["path"])
     f = probe_fields(info)
     if f["dv_profile"] == 5:
-        return "skip: Dolby Vision profile 5 (kept as is)"
-    work = CONFIG["work_dir"]
-    os.makedirs(work, exist_ok=True)
+        return None, "skip: Dolby Vision profile 5 (kept as is)"
+    dur = row["duration"]
+    length = min(15.0, dur / 20)
+    v = main_video(info)
+    try:
+        fps = frac(v.get("avg_frame_rate") or v.get("r_frame_rate") or "24000/1001")
+    except (ValueError, ZeroDivisionError):
+        fps = 23.976
+    return {"x265_params": uhd_x265_params(row["path"], v), "preset": S("uhd_preset"), "fps": fps,
+            "crf_start": int(S("uhd_crf_start")), "crf_min": int(S("uhd_crf_min")), "vmaf": float(S("uhd_vmaf")),
+            "min_saving": float(S("uhd_min_saving")), "length": length, "duration": dur, "size": row["size"],
+            "samples": sample_points(dur, (0.2, 0.4, 0.6, 0.8), length),
+            "checks": sample_points(dur, (0.3, 0.5, 0.7), length),
+            "nonvideo": non_video_bytes(info, dur), "hdr": f["hdr"], "dv_profile": f["dv_profile"]}, None
+
+
+def uhd_desc(plan):
+    return f"{plan['hdr'] or 'SDR'}{' P' + str(plan['dv_profile']) if plan['dv_profile'] else ''}"
+
+
+def uhd_assemble(row, video, work):
+    """Light server part after the encode: the encoded picture (`video`, a video-only MKV) + Dolby Vision data
+    (taken from the original) + every other track of the original -> one MKV. Returns (path, None) or (None, reason)."""
+    src = row["path"]
+    info = ffprobe(src)
+    v = main_video(info)
+    dvp = dv_profile(v)
     tmp = os.path.join(work, f"uhd-{row['id']}.mkv")
     hevc, hevc_dv, rpu = tmp + ".hevc", tmp + ".dv.hevc", tmp + ".rpu"
-    t0 = time.time()
+    tags = v.get("tags") or {}
+    mk = ["nice", "-n", CONFIG["nice"], "mkvmerge", "-q", "-o", tmp, "--language", f"0:{tags.get('language') or 'und'}"]
+    if tags.get("title"):
+        mk += ["--track-name", f"0:{tags['title']}"]
     try:
-        x265_params = uhd_x265_params(src, v)
-        length = min(15.0, row["duration"] / 20)
-        log(f"4K START [x265 {S('uhd_preset')}] {src} ({gb(row['size'])}, {f['hdr'] or 'SDR'}"
-            f"{' P' + str(f['dv_profile']) if f['dv_profile'] else ''})")
-        crf, est, scores = uhd_pick_crf(src, row, x265_params, work, length)
-        if crf is None:
-            return f"kept: {est} (samples {scores})"
-        nonvid = non_video_bytes(info, row["duration"])
-        if est + nonvid > row["size"] * (1 - float(S("uhd_min_saving"))):
-            return f"too-small-gain: samples say {(est + nonvid) / row['size']:.0%} of the original at CRF {crf}"
-        free = shutil.disk_usage(work).free
-        if free < 3 * (est + nonvid) + 20e9:
-            return f"skip: not enough scratch space ({gb(free)} free)"
-        log(f"4K ENCODE CRF {crf} (samples VMAF {scores}, expect ~{gb(est + nonvid)}): {src}")
-        if f["dv_profile"]:
-            # Dolby Vision: take the RPU (profile 7 -> 8.1), encode the picture, put the RPU back, mux with mkvmerge
+        if dvp:
+            # Dolby Vision: take the RPU (profile 7 -> 8.1), put it into the new stream, frame counts must match
             ext = subprocess.Popen(["nice", "-n", CONFIG["nice"], "ffmpeg", "-hide_banner", "-nostdin", "-v", "error",
                                     "-i", src, "-map", "0:v:0", "-c:v", "copy", "-bsf:v", "hevc_mp4toannexb", "-f", "hevc", "-"],
                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            dv = subprocess.run(["dovi_tool"] + (["-m", "2"] if f["dv_profile"] == 7 else []) + ["extract-rpu", "-", "-o", rpu],
-                                stdin=ext.stdout, capture_output=True, text=True)
+            dv = subprocess.run(["nice", "-n", CONFIG["nice"], "dovi_tool"] + (["-m", "2"] if dvp == 7 else [])
+                                + ["extract-rpu", "-", "-o", rpu], stdin=ext.stdout, capture_output=True, text=True)
             ext.stdout.close()
             ext.wait()
             if dv.returncode != 0 or not os.path.exists(rpu):
-                return f"failed: dovi_tool extract-rpu: {(dv.stderr or dv.stdout).strip()[-200:]}"
-            run(["nice", "-n", CONFIG["nice"], "ffmpeg", "-hide_banner", "-nostdin", "-y", "-v", "error", "-i", src,
-                 "-map", "0:v:0"] + uhd_video_args(crf, x265_params) + ["-f", "hevc", hevc])
-            run(["dovi_tool", "inject-rpu", "-i", hevc, "--rpu-in", rpu, "-o", hevc_dv])
+                return None, f"failed: dovi_tool extract-rpu: {(dv.stderr or dv.stdout).strip()[-200:]}"
+            run(["nice", "-n", CONFIG["nice"], "ffmpeg", "-hide_banner", "-nostdin", "-y", "-v", "error", "-i", video,
+                 "-map", "0:v:0", "-c:v", "copy", "-bsf:v", "hevc_mp4toannexb", "-f", "hevc", hevc])
+            run(["nice", "-n", CONFIG["nice"], "dovi_tool", "inject-rpu", "-i", hevc, "--rpu-in", rpu, "-o", hevc_dv])
             os.remove(hevc)
             n_rpu = re.search(r"Frames:\s*(\d+)", run(["dovi_tool", "info", "-i", rpu, "--summary"]).stdout)
             n_vid = run(["ffprobe", "-v", "error", "-count_packets", "-select_streams", "v:0", "-show_entries",
                          "stream=nb_read_packets", "-of", "csv=p=0", hevc_dv], timeout=3 * H).stdout.strip()
             if not n_rpu or int(n_rpu.group(1)) != int(n_vid or 0):
-                return f"failed: Dolby Vision frame count differs (RPU {n_rpu.group(1) if n_rpu else '?'}, video {n_vid})"
-            tags = v.get("tags") or {}
-            mk = ["mkvmerge", "-q", "-o", tmp, "--default-duration", f"0:{v.get('r_frame_rate') or '24000/1001'}p",
-                  "--language", f"0:{tags.get('language') or 'und'}"]
-            if tags.get("title"):
-                mk += ["--track-name", f"0:{tags['title']}"]
-            p = subprocess.run(mk + [hevc_dv, "--no-video", src], capture_output=True, text=True)
-            if p.returncode not in (0, 1):   # 1 = warnings only
-                return f"failed: mkvmerge: {(p.stdout + p.stderr).strip()[-200:]}"
-            os.remove(hevc_dv)
+                return None, f"failed: Dolby Vision frame count differs (RPU {n_rpu.group(1) if n_rpu else '?'}, video {n_vid})"
+            mk += ["--default-duration", f"0:{v.get('r_frame_rate') or '24000/1001'}p", hevc_dv]
         else:
-            run(["nice", "-n", CONFIG["nice"], "ffmpeg", "-hide_banner", "-nostdin", "-y", "-loglevel", "error", "-i", src]
-                + stream_args(info, True) + uhd_video_args(crf, x265_params)
-                + ["-max_muxing_queue_size", "4096", "-f", "matroska", tmp])
-        # quality + metadata check of the finished file, at points the samples did not cover
-        out_info = ffprobe(tmp)
-        ov = main_video(out_info)
+            mk += [video]
+        p = subprocess.run(mk + ["--no-video", src], capture_output=True, text=True)
+        if p.returncode not in (0, 1):   # 1 = warnings only
+            return None, f"failed: mkvmerge: {(p.stdout + p.stderr).strip()[-200:]}"
+        ov = main_video(ffprobe(tmp))
         if ov.get("color_transfer") != v.get("color_transfer"):
-            return f"failed: HDR signalling lost ({ov.get('color_transfer')} vs {v.get('color_transfer')})"
-        if f["dv_profile"] and dv_profile(ov) != 8:
-            return f"failed: Dolby Vision lost (output profile {dv_profile(ov)})"
+            return None, f"failed: HDR signalling lost ({ov.get('color_transfer')} vs {v.get('color_transfer')})"
+        if dvp and dv_profile(ov) != 8:
+            return None, f"failed: Dolby Vision lost (output profile {dv_profile(ov)})"
+        return tmp, None
+    finally:
+        for x in (hevc, hevc_dv, rpu):
+            if os.path.exists(x):
+                os.remove(x)
+
+
+def uhd_encode(row):
+    """One 4K file on this server: pick the CRF on samples, encode, check quality again, assemble, safe replace."""
+    src = row["path"]
+    plan, why = uhd_prepare(row)
+    if why:
+        return why
+    work = CONFIG["work_dir"]
+    os.makedirs(work, exist_ok=True)
+    video, tmp = os.path.join(work, f"uhd-{row['id']}.video.mkv"), None
+    t0 = time.time()
+    try:
+        log(f"4K START [x265 {plan['preset']}] {src} ({gb(row['size'])}, {uhd_desc(plan)})")
+        crf, est, scores = uhd_pick_crf(src, row["id"], plan, work)
+        if crf is None:
+            return f"kept: {est} (samples {scores})"
+        if est + plan["nonvideo"] > row["size"] * (1 - plan["min_saving"]):
+            return f"too-small-gain: samples say {(est + plan['nonvideo']) / row['size']:.0%} of the original at CRF {crf}"
+        free = shutil.disk_usage(work).free
+        if free < 3 * (est + plan["nonvideo"]) + 20e9:
+            return f"skip: not enough scratch space ({gb(free)} free)"
+        log(f"4K ENCODE CRF {crf} (samples VMAF {scores}, expect ~{gb(est + plan['nonvideo'])}): {src}")
+        run(["nice", "-n", CONFIG["nice"], "ffmpeg", "-hide_banner", "-nostdin", "-y", "-v", "error", "-i", src,
+             "-map", "0:v:0"] + uhd_video_args(crf, plan) + ["-f", "matroska", video])
+        # quality check of the finished picture, at points the samples did not cover
         final = []
-        for i, t in enumerate(sample_points(row["duration"], (0.3, 0.5, 0.7), length)):
-            mean, low, frames = vmaf_score(src, t, length, tmp, t, work, f"{row['id']}-f{i}")
-            if frames < length * 20:
+        for i, t in enumerate(plan["checks"]):
+            mean, low, frames = vmaf_score(src, t, plan["length"], video, t, work, f"{row['id']}-f{i}")
+            if frames < plan["length"] * 20:
                 return f"failed: final VMAF compared only {frames} frames"
             final.append(round(mean, 2))
-        if min(final) < float(S("uhd_vmaf")) - 1:
-            return f"kept: finished file scored VMAF {final} (target {S('uhd_vmaf')})"
+        if min(final) < plan["vmaf"] - 1:
+            return f"kept: finished file scored VMAF {final} (target {plan['vmaf']:g})"
+        tmp, why = uhd_assemble(row, video, work)
+        if why:
+            return why
         log(f"4K CHECKED VMAF {final}, {gb(os.path.getsize(tmp))}: {src}")
         return finalize(row, tmp, t0, "4K")
     finally:
-        for x in (tmp, hevc, hevc_dv, rpu):
-            if os.path.exists(x):
+        for x in (video, tmp):
+            if x and os.path.exists(x):
+                os.remove(x)
+
+
+def uhd_finish_remote(row, video, who, vmaf_note):
+    """A 4K worker PC uploaded the encoded picture (already quality-checked there): assemble + safe replace here."""
+    t0 = time.time()
+    tmp = None
+    try:
+        tmp, why = uhd_assemble(row, video, CONFIG["work_dir"])
+        if why:
+            return why
+        log(f"4K CHECKED [{who}] VMAF {vmaf_note}, {gb(os.path.getsize(tmp))}: {row['path']}")
+        return finalize(row, tmp, t0, who)
+    finally:
+        for x in (video, tmp):
+            if x and os.path.exists(x):
                 os.remove(x)
 
 
@@ -1171,7 +1234,7 @@ def uhd_worker():
     with db() as c:   # a 4K job that was running when Leanarr stopped goes back into the queue
         c.execute("update files set status='candidate', worker=null, lease_until=null where status='working' and worker='4K'")
     while True:
-        if S("uhd_mode") != "shrink" or not in_window(S("uhd_window")):
+        if S("uhd_mode") != "shrink" or not S_bool("uhd_local") or not in_window(S("uhd_window")):
             time.sleep(60)
             continue
         with CLAIM_LOCK:
@@ -1188,6 +1251,33 @@ def uhd_worker():
         except Exception as e:
             result = f"failed: {e}"
         record_result(row, result, "4K")
+
+
+def claim_uhd(worker_name):
+    """Give a 4K worker PC the next 4K job with its encode settings, or None."""
+    if S("uhd_mode") != "shrink":
+        return None, "4K mode is not 'shrink'"
+    if not in_window(S("uhd_window")) or not in_window(S("remote_window")):
+        return None, "outside the 4K / remote worker hours"
+    with CLAIM_LOCK:
+        for _ in range(25):
+            row = next_candidate(uhd=1)
+            if not row:
+                return None, "no 4K candidates"
+            try:
+                plan, why = uhd_prepare(row)
+            except Exception as e:
+                plan, why = None, f"failed: {e}"
+            if why:
+                record_result(row, why, worker_name)
+                continue
+            with db() as c:   # long jobs: the worker's progress reports keep extending this
+                c.execute("update files set status='working', worker=?, lease_until=? where path=?",
+                          (worker_name, time.time() + UHD_LEASE, row["path"]))
+            log(f"4K CLAIMED by {worker_name} [x265 {plan['preset']}]: {row['path']} ({gb(row['size'])}, {uhd_desc(plan)})")
+            return {"id": row["id"], "name": os.path.basename(row["path"]), "size": row["size"],
+                    "duration": row["duration"], "kind": "uhd", "uhd": plan}, None
+    return None, "nothing eligible right now"
 
 
 # ------------------------------------------------------------------ remote worker API
@@ -1209,6 +1299,8 @@ def claim(worker_name, kind):
                       (worker_name,))
     for p in lost:
         log(f"REQUEUED (lost job, {worker_name} asked for new work): {p}")
+    if kind == "uhd":   # 4K worker PC: only 4K jobs, never the normal shrink queue
+        return claim_uhd(worker_name)
     if S("mode") != "shrink":
         return None, "report mode"
     if not in_window(S("remote_window")):
@@ -1303,7 +1395,8 @@ def status_page():
                  f"<div class='scroll'><table>{drows}</table></div>")
     body = (f"<h1>Leanarr <small>mode <b>{S('mode')}</b> · local CPU {'on' if S_bool('local_worker') else 'off'} "
             f"({S('window')}) · remote workers {'on' if CONFIG['worker_token'] else 'off'} ({S('remote_window')}) "
-            f"· 4K <b>{S('uhd_mode')}</b> ({esc(S('uhd_window'))}, VMAF ≥ {S('uhd_vmaf')})</small></h1>{warn}"
+            f"· 4K <b>{S('uhd_mode')}</b> ({'this server + ' if S_bool('uhd_local') else ''}4K workers, "
+            f"{esc(S('uhd_window'))}, VMAF ≥ {S('uhd_vmaf')})</small></h1>{warn}"
             f"<div class='cards'>{cards}</div>{dolby}"
             f"<h2>Workers</h2><div class='scroll'><table>{wk}</table></div>"
             f"<h2>Working on</h2><div class='scroll'><table>{working}</table></div>"
@@ -1342,6 +1435,7 @@ def worker_setup_page(host):
                     "set LEANARR_WORKER_TOKEN on the server first.</div>")
     cmd = (f"$s = Invoke-RestMethod {server}/download/Setup-LeanarrWorker.ps1; "
            f"& ([scriptblock]::Create($s)) -Server '{server}' -Token '{CONFIG['worker_token']}'")
+    cmd_uhd = cmd + " -Kind uhd"
     esc = html.escape
     body = f"""<h1>Add a GPU worker</h1>
 <p>Do this <b>on the PC with the NVIDIA graphics card</b>. It takes about 5 minutes and needs the internet once
@@ -1359,6 +1453,13 @@ Right-click in the terminal window (or Ctrl+V), then <b>Enter</b>. Wait until it
 <div class='row card'><b>4. Check it here</b><br>The worker shows up on the <a href='/'>status page</a> once it gets its
 first job (only in <b>shrink</b> mode and inside the "Remote worker hours" on the <a href='/settings'>settings page</a>).
 Its log on that PC: <code>C:\\LeanarrWorker\\worker.log</code>.</div>
+<div class='row card'><b>4K worker (optional, any fast CPU, no graphics card needed)</b><br>
+Takes the 4K mode's heavy work (quality tests, x265 encode, quality check) off this server. Same steps, this command
+(it can run next to a GPU worker on the same PC: own task "Leanarr 4K Worker", log <code>C:\\LeanarrWorker\\worker-4k.log</code>).
+Needs about twice the size of the biggest 4K movie free on C:.
+<textarea id='cmd4k' readonly rows='4' style='width:100%;font:13px monospace;margin:6px 0'>{esc(cmd_uhd)}</textarea>
+<button onclick="navigator.clipboard.writeText(document.getElementById('cmd4k').value).then(()=>this.textContent='Copied!')">Copy</button>
+Then turn off "4K: encode on this server too" on the <a href='/settings'>settings page</a> if this server should not encode 4K itself.</div>
 <details class='row card'><summary><b>What the command does / how to remove it</b></summary>
 <p>It downloads <code>Setup-LeanarrWorker.ps1</code> from this server and runs it: checks the NVIDIA driver, installs
 Python 3.12 (winget), downloads ffmpeg (gyan.dev, checksum verified), does a 2-second GPU test, and creates the
@@ -1486,20 +1587,55 @@ class Web(BaseHTTPRequestHandler):
             job, why = claim(name, kind)
             worker_seen(name, kind, str(body.get("version") or "")[:20], self.client_address[0],
                         f"job: {job['name']}" if job else f"idle ({why})")
-            return self.send(200, json.dumps(job), "application/json") if job else self.send(204)
+            if not job:
+                return self.send(204)
+            try:
+                return self.send(200, json.dumps(job), "application/json")
+            except OSError:   # the worker gave up waiting (e.g. qBittorrent was slow): it never got this job
+                with db() as c:
+                    c.execute("update files set status='candidate', worker=null, lease_until=null "
+                              "where rowid=? and status='working'", (job["id"],))
+                log(f"REQUEUED (worker {name} hung up before it got the job): {job['name']}")
         m = re.fullmatch(r"/api/worker/fail/(\d+)", self.path)
         if m:
             body = self.read_json()
             row = job_row(int(m.group(1)))
             if row:
                 err = str(body.get("error"))[:250]
-                if re.search(r"(?i)download incomplete|timed out|connection|reset by peer|server not reachable", err):
+                if re.search(r"(?i)download incomplete|timed out|connection|reset by peer|server not reachable"
+                             r"|not enough space on the worker", err):
                     # transfer problem (e.g. Leanarr restarted mid-download): not the file's fault -> back in the queue
                     with db() as c:
                         c.execute("update files set status='candidate', worker=null, lease_until=null where path=?", (row["path"],))
                     log(f"REQUEUED (transfer problem, {row['worker']}): {row['path']}: {err}")
                 else:
                     record_result(row, "failed: worker: " + err, row["worker"] or "remote")
+            return self.send(200, "ok")
+        m = re.fullmatch(r"/api/worker/progress/(\d+)", self.path)
+        if m:   # long 4K jobs: progress note for the status page, optional log line, lease extended
+            body = self.read_json()
+            row = job_row(int(m.group(1)))
+            if not row:
+                return self.send(404, "no such job")
+            with db() as c:
+                c.execute("update files set lease_until=max(coalesce(lease_until,0), ?) where path=?",
+                          (time.time() + UHD_LEASE, row["path"]))
+                if body.get("note"):
+                    c.execute("update workers set note=?, last_seen=? where name=?",
+                              (str(body["note"])[:200], time.time(), row["worker"]))
+            if body.get("log"):
+                log(f"  [{row['worker']}] {str(body['log'])[:300]}")
+            return self.send(200, "ok")
+        m = re.fullmatch(r"/api/worker/report/(\d+)", self.path)
+        if m:   # a 4K worker decided not to encode (quality target not reached / too small a saving)
+            body = self.read_json()
+            row = job_row(int(m.group(1)))
+            if not row:
+                return self.send(404, "no such job")
+            res = str(body.get("result") or "")[:300]
+            if not res.startswith(("kept: ", "too-small-gain: ")):
+                res = "failed: worker: " + res
+            record_result(row, res, row["worker"] or "remote")
             return self.send(200, "ok")
         self.send(404, "not found")
 
@@ -1511,7 +1647,7 @@ class Web(BaseHTTPRequestHandler):
         if not row:
             return self.send(404, "no such job (expired or already handled)")
         os.makedirs(CONFIG["work_dir"], exist_ok=True)
-        tmp = os.path.join(CONFIG["work_dir"], f"remote-{row['id']}.mkv")
+        tmp = os.path.join(CONFIG["work_dir"], f"remote-{row['id']}{'.video' if row['uhd'] else ''}.mkv")
         left = int(self.headers.get("Content-Length") or 0)
         with open(tmp, "wb") as f:
             while left > 0:
@@ -1524,8 +1660,17 @@ class Web(BaseHTTPRequestHandler):
             os.remove(tmp)
             record_result(row, "failed: upload incomplete", row["worker"] or "remote")
             return self.send(400, json.dumps({"result": "upload incomplete"}), "application/json")
-        result = finalize(row, tmp, row["lease_until"] - int(S("lease_hours")) * H, row["worker"] or "remote")
-        record_result(row, result, row["worker"] or "remote")
+        who = row["worker"] or "remote"
+        try:
+            if row["uhd"]:
+                result = uhd_finish_remote(row, tmp, who, str(self.headers.get("X-Leanarr-Vmaf") or "?")[:80])
+            else:
+                result = finalize(row, tmp, row["lease_until"] - int(S("lease_hours")) * H, who)
+        except Exception as e:
+            result = f"failed: {e}"
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        record_result(row, result, who)
         self.send(200, json.dumps({"result": result}), "application/json")
 
 

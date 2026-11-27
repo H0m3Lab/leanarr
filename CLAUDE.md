@@ -31,10 +31,14 @@ One Python process (`leanarr.py`), standard library only:
   the original with `tidy_cmd()`, checks it with `tidy_verify()`, re-checks seeding, then renames it over the
   original. `finalize()` runs the same step while a shrunk file is copied in. It never runs on a file a shrink
   job is working on (and the other way round).
-- **4K mode (optional):** `decide_uhd()` marks 4K files above the bitrate floor (`uhd` column = 1; only
-  `uhd_worker()` takes them, `next_candidate(uhd=1)`). `uhd_encode()`: `uhd_pick_crf()` (samples + `vmaf_score()`
-  via FIFOs and the `vmaf` CLI), full x265 encode, Dolby Vision RPU with dovi_tool + mkvmerge, final VMAF + HDR/DV
-  check, then `finalize()`. Results below target return `kept: ...` (status `kept`, never retried unless the file changes).
+- **4K mode (optional):** `decide_uhd()` marks 4K files above the bitrate floor (`uhd` column = 1; only the local
+  `uhd_worker()` and remote workers of kind `uhd` take them, `next_candidate(uhd=1)`). `uhd_prepare()` builds the plan
+  (checks, x265 params incl. HDR10 metadata, sample points). Local `uhd_encode()`: `uhd_pick_crf()` (samples +
+  `vmaf_score()` via FIFOs and the `vmaf` CLI), video-only x265 encode, final VMAF. Remote: `claim_uhd()` sends the plan,
+  the worker's `run_uhd()` does the same with ffmpeg's libvmaf and uploads the video-only MKV (progress via
+  `/api/worker/progress`, kept/too-small-gain via `/api/worker/report`). Both end in `uhd_assemble()` (Dolby Vision RPU
+  with dovi_tool, mkvmerge with the original's other tracks, HDR/DV check) and `finalize()`. Results below target return
+  `kept: ...` (status `kept`, never retried unless the file changes).
 - **Web UI:** `Web` (`ThreadingHTTPServer`) serves the status page, `/report.json`, `/settings`,
   `/worker-setup`, `/health`, and the worker API on `LEANARR_PORT` (8282).
 
