@@ -509,6 +509,8 @@ def scan():
                 on_disk.add(p)
                 seen += 1
                 prev = known.get(p)
+                if prev and prev[2] == "done" and own.get(p) == st.st_size:
+                    continue   # Leanarr's own finished file: keep the 'done' record (original size = the saving)
                 same = prev and prev[0] == st.st_size and prev[1] == st.st_mtime
                 if same and prev[2] in ("done", "failed", "too-small-gain", "kept", "working") and prev[3] is not None:
                     continue

@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- Finished shrinks disappeared from the totals: the next library scan saw the new (smaller) file, judged it again
+  ("already hevc") and overwrote its 'done' record with the original size. The scan now keeps the record of a file
+  Leanarr wrote itself.
+
 ## [0.6.0] - 2026-11-27
 
 ### Added
